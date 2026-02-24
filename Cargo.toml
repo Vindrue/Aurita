@@ -1,0 +1,27 @@
+[package]
+name = "aurita"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-based computer algebra system"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Serialization (for CAS IPC protocol)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime (for non-blocking CAS calls)
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Unicode
+unicode-width = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1"
