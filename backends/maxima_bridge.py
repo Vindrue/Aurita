@@ -13,6 +13,7 @@ import sys
 import os
 import json
 import re
+import select
 import subprocess
 import traceback
 
@@ -25,69 +26,94 @@ import sympy
 from sympy import parse_expr
 
 
+class MaximaTimeout(Exception):
+    """Raised when Maxima takes too long or asks an interactive question."""
+    pass
+
+
+# Seconds to wait for Maxima to produce the next byte of output.
+MAXIMA_READ_TIMEOUT = 5
+
+
 class MaximaProcess:
     """Manages a Maxima subprocess."""
 
     def __init__(self):
+        self._spawn()
+
+    def _spawn(self):
+        """Spawn (or re-spawn) the Maxima process."""
         self.proc = subprocess.Popen(
             ["maxima"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
         )
-        # Read startup banner until first prompt
-        self._read_until_prompt()
+        self._fd = self.proc.stdout.fileno()
+        # Read startup banner until first prompt (generous timeout for startup)
+        self._read_until_prompt(timeout=30)
         # Initialize: disable 2D display, set long line length
         self._send_raw("display2d:false$")
-        self._read_until_prompt()
+        self._read_until_prompt(timeout=10)
         self._send_raw("linel:10000$")
-        self._read_until_prompt()
+        self._read_until_prompt(timeout=10)
 
     def _send_raw(self, cmd):
         """Send a raw command to Maxima."""
-        self.proc.stdin.write(cmd + "\n")
+        self.proc.stdin.write((cmd + "\n").encode())
         self.proc.stdin.flush()
 
-    def _read_until_prompt(self):
+    def _read_char(self, timeout):
+        """Read a single byte from Maxima stdout with a timeout.
+
+        Uses select() on the raw fd + os.read() to avoid Python's
+        internal buffering which can defeat timeout logic.
+        """
+        ready, _, _ = select.select([self._fd], [], [], timeout)
+        if not ready:
+            raise MaximaTimeout("Maxima did not respond in time")
+        data = os.read(self._fd, 1)
+        if not data:
+            return None
+        return data.decode('utf-8', errors='replace')
+
+    def _read_until_prompt(self, timeout=MAXIMA_READ_TIMEOUT):
         """Read Maxima output until we see an input prompt (%iN).
 
-        Reads character-by-character to handle prompts that appear on
-        the same line as output (no trailing newline).
+        Uses select()+os.read() with a per-byte timeout so we detect
+        when Maxima stalls (e.g. asking an interactive question).
         """
         buf = []
         output_lines = []
         while True:
-            ch = self.proc.stdout.read(1)
-            if not ch:
-                # EOF
+            ch = self._read_char(timeout)
+            if ch is None:
                 break
             buf.append(ch)
             if ch == '\n':
                 line = ''.join(buf).rstrip('\n')
                 buf = []
-                # Check if this line IS a prompt
                 if re.match(r'^\(%i\d+\)\s*$', line):
                     break
-                # Strip output labels from content lines
                 output_lines.append(line)
             else:
-                # Check if buffer so far matches a prompt (no newline at end)
                 current = ''.join(buf)
-                if re.match(r'^\(%i\d+\)\s*$', current.rstrip()):
-                    # Peek: is there more on this line? Wait briefly.
-                    # Actually, Maxima puts prompt at start of line and waits,
-                    # so if we see (%iN) followed by nothing, that's the prompt.
-                    # But we need to be careful — check if we have the full pattern.
-                    if re.match(r'^\(%i\d+\) $', current):
-                        break
+                if re.match(r'^\(%i\d+\) $', current):
+                    break
         return '\n'.join(output_lines)
 
     def execute(self, cmd):
-        """Send a command to Maxima and return the output text."""
+        """Send a command to Maxima and return the output text.
+
+        If Maxima hangs (e.g. asks an interactive question), kills and
+        restarts the process, then raises MaximaTimeout.
+        """
         self._send_raw(cmd)
-        raw = self._read_until_prompt()
+        try:
+            raw = self._read_until_prompt(timeout=MAXIMA_READ_TIMEOUT)
+        except MaximaTimeout:
+            self._restart()
+            raise
 
         # Extract result: strip output labels like (%o2)
         result_lines = []
@@ -97,6 +123,15 @@ class MaximaProcess:
 
         result = "\n".join(result_lines).strip()
         return result
+
+    def _restart(self):
+        """Kill the current Maxima process and start a fresh one."""
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=3)
+        except Exception:
+            pass
+        self._spawn()
 
     def close(self):
         """Shut down the Maxima process."""
@@ -400,6 +435,9 @@ def handle_request(maxima, req):
             return {"id": req_id, "status": "error",
                     "error": f"unknown operation: {op_name}"}
 
+    except MaximaTimeout:
+        return {"id": req_id, "status": "error",
+                "error": "Maxima timed out (likely needs assumptions about variables)"}
     except Exception as e:
         return {"id": req_id, "status": "error", "error": str(e)}
 
