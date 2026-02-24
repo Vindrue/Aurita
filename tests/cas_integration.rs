@@ -173,3 +173,82 @@ fn test_eval_function() {
         _ => panic!("eval(pi) should be numeric, got: {}", result),
     }
 }
+
+// --- int() range syntax tests ---
+
+#[test]
+fn test_int_range_syntax() {
+    // int(x^2, x, 0..1) = 1/3  (3-arg range form)
+    let result = eval_str("int(x^2, x, 0..1)");
+    assert!(result == "1/3" || result.contains("0.333"),
+        "Expected 1/3, got: {}", result);
+}
+
+#[test]
+fn test_int_range_symbolic_bounds() {
+    // int(sin(x), x, 0..pi) = 2
+    let result = eval_str("int(sin(x), x, 0..pi)");
+    assert!(result == "2" || result == "2.0",
+        "Expected 2, got: {}", result);
+}
+
+// --- Plot integration tests ---
+
+#[test]
+fn test_plot_with_cas_lambdify() {
+    // erf(x) can't be evaluated in pure Rust — should fall back to CAS lambdify
+    let result = eval_with_cas("plot(erf(x), -3..3)");
+    match result {
+        Ok(Value::Plot(p)) => {
+            let valid = p.spec.series[0].points.iter().filter(|p| p.is_some()).count();
+            assert!(valid > 100, "Expected many valid points from CAS lambdify, got: {}", valid);
+        }
+        Ok(other) => panic!("Expected plot, got: {}", other),
+        Err(e) => panic!("Plot failed: {}", e),
+    }
+}
+
+#[test]
+fn test_plot_matplotlib_rendering() {
+    // With CAS backend, plots should be rendered by matplotlib (larger, richer PNGs)
+    let result = eval_with_cas("plot(sin(x), -3..3)");
+    match result {
+        Ok(Value::Plot(p)) => {
+            // matplotlib PNGs are typically >10KB, plotters fallback ~5KB
+            assert!(p.png_bytes.len() > 5000,
+                "Expected matplotlib-rendered PNG (>5KB), got {} bytes", p.png_bytes.len());
+            // Verify valid PNG
+            assert_eq!(&p.png_bytes[1..4], b"PNG");
+        }
+        Ok(other) => panic!("Expected plot, got: {}", other),
+        Err(e) => panic!("Plot failed: {}", e),
+    }
+}
+
+#[test]
+fn test_plot_multi_curve_matplotlib() {
+    let result = eval_with_cas("plot([sin(x), cos(x)], -3..3)");
+    match result {
+        Ok(Value::Plot(p)) => {
+            assert_eq!(p.spec.series.len(), 2);
+            assert!(!p.png_bytes.is_empty());
+        }
+        Ok(other) => panic!("Expected plot, got: {}", other),
+        Err(e) => panic!("Plot failed: {}", e),
+    }
+}
+
+#[test]
+fn test_plot_discontinuity_detection() {
+    // tan(x) has discontinuities at pi/2 + n*pi — gaps should be inserted
+    let result = eval_with_cas("plot(tan(x), -4..4)");
+    match result {
+        Ok(Value::Plot(p)) => {
+            let gaps = p.spec.series[0].points.iter().filter(|p| p.is_none()).count();
+            assert!(gaps > 0,
+                "Expected discontinuity gaps in tan(x) plot, got 0 gaps");
+        }
+        Ok(other) => panic!("Expected plot, got: {}", other),
+        Err(e) => panic!("Plot failed: {}", e),
+    }
+}

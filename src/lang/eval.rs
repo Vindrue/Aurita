@@ -1,11 +1,13 @@
 use crate::cas::backend::CasBackend;
-use crate::cas::protocol::CasOp;
+use crate::cas::protocol::{CasOp, PlotSeriesData};
 use crate::lang::ast::*;
-use crate::lang::builtins::register_builtins;
+use crate::lang::builtins::{numeric_eval_sym, register_builtins};
 use crate::lang::env::{Env, EnvRef};
 use crate::lang::error::{LangError, LangResult};
 use crate::lang::token::Span;
 use crate::lang::types::*;
+use crate::plot::render::render_plot;
+use crate::plot::types::*;
 use crate::symbolic::expr::{SymExpr, SymOp};
 
 /// Signals for control flow (break, continue, return).
@@ -519,6 +521,7 @@ impl Evaluator {
             "lim" => Ok(Some(self.cas_limit(args, span)?)),
             "taylor" => Ok(Some(self.cas_taylor(args, span)?)),
             "tex" => Ok(Some(self.cas_latex(args, span)?)),
+            "plot" => Ok(Some(self.eval_plot(args, span)?)),
             _ => Ok(None),
         }
     }
@@ -614,6 +617,21 @@ impl Evaluator {
                 LangError::type_err("int: upper bound must be numeric or symbolic").with_span(span)
             })?;
             (Some(lo), Some(hi))
+        } else if args.len() == 3 {
+            // int(expr, var, lo..hi) — range syntax
+            if let Expr::Range { start, end, .. } = &args[2] {
+                let lo = self.eval_expr(start)?.to_sym_expr().ok_or_else(|| {
+                    LangError::type_err("int: lower bound must be numeric or symbolic").with_span(span)
+                })?;
+                let hi = self.eval_expr(end)?.to_sym_expr().ok_or_else(|| {
+                    LangError::type_err("int: upper bound must be numeric or symbolic").with_span(span)
+                })?;
+                (Some(lo), Some(hi))
+            } else {
+                return Err(LangError::eval(
+                    "int: 3rd argument must be a range (e.g. 0..1), or use 4-arg form: int(expr, var, lo, hi)"
+                ).with_span(span));
+            }
         } else {
             (None, None)
         };
@@ -817,6 +835,268 @@ impl Evaluator {
         Ok(Value::Str(latex_str))
     }
 
+    // --- Plotting ---
+
+    fn eval_plot(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(LangError::arity(
+                "plot: expected 1-2 arguments: plot(expr, range?) or plot([e1, e2, ...], range?)"
+            ).with_span(span));
+        }
+
+        // Parse range from 2nd arg (or default)
+        let (x_min, x_max) = if args.len() == 2 {
+            self.parse_plot_range(&args[1], span)?
+        } else {
+            (DEFAULT_X_MIN, DEFAULT_X_MAX)
+        };
+
+        // Parse expression(s): single expr or vector of exprs
+        let exprs: Vec<&Expr> = match &args[0] {
+            Expr::Vector(elements, _) => elements.iter().collect(),
+            other => vec![other],
+        };
+
+        // Collect all free variables across all exprs
+        let mut all_free = Vec::new();
+        for expr in &exprs {
+            let val = self.eval_expr(expr)?;
+            if let Some(sym) = val.to_sym_expr() {
+                for s in sym.free_symbols() {
+                    if !all_free.contains(&s) {
+                        all_free.push(s);
+                    }
+                }
+            }
+        }
+
+        let var = if all_free.len() == 1 {
+            all_free[0].clone()
+        } else if all_free.contains(&"x".to_string()) {
+            "x".to_string()
+        } else if all_free.is_empty() {
+            // Constant expression — still plot it
+            "x".to_string()
+        } else {
+            return Err(LangError::eval(format!(
+                "plot: multiple free variables ({}) — only single-variable plots are supported",
+                all_free.join(", ")
+            )).with_span(span));
+        };
+
+        // Generate labels before binding the variable
+        let labels: Vec<String> = exprs.iter().map(|e| {
+            match self.eval_expr(e) {
+                Ok(v) => format!("{}", v),
+                Err(_) => "?".to_string(),
+            }
+        }).collect();
+
+        // Sample each expression
+        let mut series_list = Vec::new();
+        for (i, expr) in exprs.iter().enumerate() {
+            let mut points = self.sample_expression(expr, &var, x_min, x_max, DEFAULT_SAMPLES, span)?;
+            insert_discontinuity_gaps(&mut points);
+            series_list.push(Series {
+                label: labels[i].clone(),
+                points,
+            });
+        }
+
+        let spec = PlotSpec {
+            series: series_list,
+            x_min,
+            x_max,
+            title: None,
+        };
+
+        // Prefer matplotlib rendering via CAS backend
+        if self.cas.is_some() {
+            match self.render_plot_matplotlib(&spec, span) {
+                Ok(rendered) => return Ok(Value::Plot(rendered)),
+                Err(_) => {} // fall through to plotters
+            }
+        }
+
+        // Fallback: plotters (no labels/ticks, but works without Python)
+        let rendered = render_plot(&spec)
+            .map_err(|e| LangError::eval(format!("plot render: {}", e)).with_span(span))?;
+
+        Ok(Value::Plot(rendered))
+    }
+
+    /// Parse a range argument for plot: either Expr::Range or evaluate to get bounds.
+    fn parse_plot_range(&mut self, arg: &Expr, span: Span) -> LangResult<(f64, f64)> {
+        if let Expr::Range { start, end, .. } = arg {
+            let lo = self.eval_expr(start)?;
+            let hi = self.eval_expr(end)?;
+            let lo_f = self.value_to_f64(&lo).ok_or_else(|| {
+                LangError::type_err("plot: range start must be numeric").with_span(span)
+            })?;
+            let hi_f = self.value_to_f64(&hi).ok_or_else(|| {
+                LangError::type_err("plot: range end must be numeric").with_span(span)
+            })?;
+            Ok((lo_f, hi_f))
+        } else {
+            Err(LangError::type_err(
+                "plot: second argument must be a range (e.g. -5..5)"
+            ).with_span(span))
+        }
+    }
+
+    /// Sample an expression at evenly spaced x values, returning points with None for discontinuities.
+    fn sample_expression(
+        &mut self,
+        expr: &Expr,
+        var: &str,
+        x_min: f64,
+        x_max: f64,
+        n: usize,
+        span: Span,
+    ) -> LangResult<Vec<Option<(f64, f64)>>> {
+        // Save and remove current binding of var
+        let saved = self.env.borrow().get(var);
+        let mut points = Vec::with_capacity(n);
+        let mut valid_count = 0;
+
+        for i in 0..n {
+            let x = x_min + (x_max - x_min) * i as f64 / (n - 1) as f64;
+
+            // Bind var to x
+            self.env.borrow_mut().set(var.to_string(), Value::Number(Number::Float(x)));
+
+            let y = match self.eval_expr(expr) {
+                Ok(val) => self.value_to_f64(&val),
+                Err(_) => None,
+            };
+
+            match y {
+                Some(yf) if yf.is_finite() => {
+                    points.push(Some((x, yf)));
+                    valid_count += 1;
+                }
+                _ => points.push(None),
+            }
+        }
+
+        // Restore var binding
+        if let Some(prev) = saved {
+            self.env.borrow_mut().set(var.to_string(), prev);
+        } else {
+            self.env.borrow_mut().remove(var);
+        }
+
+        // If too few valid points and CAS is available, try lambdify fallback
+        if valid_count * 4 < n && self.cas.is_some() {
+            if let Ok(cas_points) = self.cas_lambdify_sample(expr, var, x_min, x_max, n, span) {
+                let cas_valid = cas_points.iter().filter(|p| p.is_some()).count();
+                if cas_valid > valid_count {
+                    return Ok(cas_points);
+                }
+            }
+        }
+
+        Ok(points)
+    }
+
+    /// CAS lambdify fallback for sampling expressions that can't be evaluated in Rust.
+    fn cas_lambdify_sample(
+        &mut self,
+        expr: &Expr,
+        var: &str,
+        x_min: f64,
+        x_max: f64,
+        n: usize,
+        span: Span,
+    ) -> LangResult<Vec<Option<(f64, f64)>>> {
+        // Evaluate expression to get SymExpr
+        // Temporarily unbind var to get symbolic form
+        let saved = self.env.borrow().get(var);
+        self.env.borrow_mut().remove(var);
+        let val = self.eval_expr(expr)?;
+        if let Some(prev) = saved {
+            self.env.borrow_mut().set(var.to_string(), prev);
+        }
+
+        let sym_expr = val.to_sym_expr().ok_or_else(|| {
+            LangError::type_err("plot: expression must be numeric or symbolic").with_span(span)
+        })?;
+
+        let x_values: Vec<f64> = (0..n)
+            .map(|i| x_min + (x_max - x_min) * i as f64 / (n - 1) as f64)
+            .collect();
+
+        let cas = self.cas.as_mut().unwrap();
+        let y_values = cas.lambdify_eval(&sym_expr, var, &x_values)
+            .map_err(|e| LangError::eval(format!("plot CAS fallback: {}", e)).with_span(span))?;
+
+        let points: Vec<Option<(f64, f64)>> = x_values
+            .iter()
+            .zip(y_values.iter())
+            .map(|(&x, y)| y.map(|yv| (x, yv)))
+            .collect();
+
+        Ok(points)
+    }
+
+    /// Convert a Value to f64, handling Number, Symbolic constants, and evaluable symbolic exprs.
+    fn value_to_f64(&self, val: &Value) -> Option<f64> {
+        match val {
+            Value::Number(n) => Some(n.as_f64()),
+            Value::Symbolic(expr) => numeric_eval_sym(expr),
+            _ => None,
+        }
+    }
+
+    /// Render a PlotSpec via the CAS backend (matplotlib).
+    fn render_plot_matplotlib(&mut self, spec: &PlotSpec, span: Span) -> LangResult<RenderedPlot> {
+        let cas = self.cas.as_mut().unwrap();
+
+        // Convert Series to PlotSeriesData (split points into separate x/y arrays)
+        let series_data: Vec<PlotSeriesData> = spec.series.iter().map(|s| {
+            let mut xs = Vec::with_capacity(s.points.len());
+            let mut ys = Vec::with_capacity(s.points.len());
+            for pt in &s.points {
+                match pt {
+                    Some((x, y)) => {
+                        xs.push(*x);
+                        ys.push(Some(*y));
+                    }
+                    None => {
+                        // Insert a NaN marker at the midpoint of the gap
+                        if let Some(last_x) = xs.last() {
+                            xs.push(*last_x);
+                        } else {
+                            xs.push(spec.x_min);
+                        }
+                        ys.push(None);
+                    }
+                }
+            }
+            PlotSeriesData {
+                label: s.label.clone(),
+                x: xs,
+                y: ys,
+            }
+        }).collect();
+
+        let png_bytes = cas.render_plot(
+            series_data,
+            spec.x_min,
+            spec.x_max,
+            PLOT_WIDTH,
+            PLOT_HEIGHT,
+            150,
+        ).map_err(|e| LangError::eval(format!("matplotlib render: {}", e)).with_span(span))?;
+
+        Ok(RenderedPlot {
+            png_bytes,
+            spec: spec.clone(),
+            width: PLOT_WIDTH,
+            height: PLOT_HEIGHT,
+        })
+    }
+
     // --- Function calls ---
 
     fn call_function(&mut self, func: &Value, args: &[Value], span: Span) -> LangResult<Value> {
@@ -899,6 +1179,17 @@ impl Evaluator {
                 self.env = prev_env;
                 result
             }
+            // Unknown symbolic variable used as function — build a symbolic call
+            Value::Symbolic(SymExpr::Sym { name }) => {
+                let sym_args: Option<Vec<SymExpr>> = args.iter().map(|a| a.to_sym_expr()).collect();
+                if let Some(sym_args) = sym_args {
+                    Ok(Value::Symbolic(SymExpr::func(name, sym_args)))
+                } else {
+                    Err(LangError::type_err(format!(
+                        "cannot call '{}' with non-numeric/symbolic arguments", name
+                    )).with_span(span))
+                }
+            }
             _ => Err(
                 LangError::type_err(format!("{} is not callable", func.type_name())).with_span(span)
             ),
@@ -951,6 +1242,43 @@ fn binop_to_symop(op: BinOpKind) -> Option<SymOp> {
         BinOpKind::Div => Some(SymOp::Div),
         BinOpKind::Pow => Some(SymOp::Pow),
         _ => None,
+    }
+}
+
+/// Detect and insert None gaps at likely discontinuities (vertical asymptotes).
+///
+/// Scans consecutive valid points; if |dy| exceeds a threshold relative to the
+/// overall y-range, inserts a None between them to break the line.
+fn insert_discontinuity_gaps(points: &mut Vec<Option<(f64, f64)>>) {
+    // Compute y-range from valid points
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for pt in points.iter() {
+        if let Some((_, y)) = pt {
+            if y.is_finite() {
+                y_min = y_min.min(*y);
+                y_max = y_max.max(*y);
+            }
+        }
+    }
+    let y_range = y_max - y_min;
+    if y_range < 1e-10 {
+        return; // constant or near-constant — no discontinuities
+    }
+
+    // Threshold: if a single step jumps more than 50% of the total y-range,
+    // it's likely a discontinuity (works for tan, 1/x, etc.)
+    let threshold = y_range * 0.5;
+
+    // Scan backwards so insertions don't shift indices we haven't processed
+    let mut i = points.len().saturating_sub(1);
+    while i > 0 {
+        if let (Some((_, y1)), Some((_, y2))) = (&points[i - 1], &points[i]) {
+            if (y2 - y1).abs() > threshold {
+                points.insert(i, None);
+            }
+        }
+        i -= 1;
     }
 }
 
@@ -1181,5 +1509,94 @@ mod tests {
         // f(t) where t is undefined -> symbolic
         let v = eval_with(&mut e, "f(t)");
         assert!(matches!(v, Value::Symbolic(_)));
+    }
+
+    // --- Plot tests ---
+
+    #[test]
+    fn test_plot_basic() {
+        let v = eval("plot(x^2)");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            assert_eq!(p.spec.series.len(), 1);
+            assert!(!p.png_bytes.is_empty());
+            assert_eq!(p.spec.x_min, -10.0);
+            assert_eq!(p.spec.x_max, 10.0);
+        }
+    }
+
+    #[test]
+    fn test_plot_with_range() {
+        let v = eval("plot(x^2, -5..5)");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            assert_eq!(p.spec.x_min, -5.0);
+            assert_eq!(p.spec.x_max, 5.0);
+        }
+    }
+
+    #[test]
+    fn test_plot_multi_curve() {
+        let v = eval("plot([sin(x), cos(x)])");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            assert_eq!(p.spec.series.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_plot_user_function() {
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "f(x) = x^2 + 1");
+        let v = eval_with(&mut e, "plot(f(x))");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            // Check some sample points: f(0) = 1, f(1) = 2, f(-1) = 2
+            let pts: Vec<_> = p.spec.series[0].points.iter().filter_map(|p| *p).collect();
+            assert!(!pts.is_empty());
+            // Find point near x=0
+            let near_zero = pts.iter().find(|(x, _)| x.abs() < 0.05).unwrap();
+            assert!((near_zero.1 - 1.0).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn test_plot_constant_expr() {
+        // Constant expression — should produce a flat line
+        let v = eval("plot(5, -2..2)");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            let pts: Vec<_> = p.spec.series[0].points.iter().filter_map(|p| *p).collect();
+            assert!(pts.iter().all(|(_, y)| (*y - 5.0).abs() < 1e-10));
+        }
+    }
+
+    #[test]
+    fn test_plot_trig() {
+        let v = eval("plot(sin(x), 0..6)");
+        assert!(matches!(v, Value::Plot(_)));
+        if let Value::Plot(p) = &v {
+            let pts: Vec<_> = p.spec.series[0].points.iter().filter_map(|p| *p).collect();
+            // sin(0) ≈ 0
+            assert!(pts[0].1.abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_plot_preserves_env() {
+        // plot() should not leave the sampling variable bound
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "plot(x^2)");
+        // x should still be symbolic (unbound)
+        let v = eval_with(&mut e, "x");
+        assert!(matches!(v, Value::Symbolic(_)));
+    }
+
+    #[test]
+    fn test_plot_display() {
+        let v = eval("plot(sin(x))");
+        let display = format!("{}", v);
+        assert!(display.contains("plot:"));
+        assert!(display.contains("sin(x)"));
     }
 }

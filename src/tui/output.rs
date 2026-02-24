@@ -1,12 +1,40 @@
+use crate::plot::types::RenderedPlot;
 use crate::tui::theme::Theme;
 use ratatui::style::Style;
+use ratatui_image::protocol::StatefulProtocol;
+use std::cell::RefCell;
+
+/// Height in terminal rows allocated for a plot image.
+pub const PLOT_ROWS: u16 = 20;
 
 /// A single entry in the worksheet output.
-#[derive(Debug, Clone)]
 pub struct WorksheetEntry {
     pub index: usize,
     pub input: String,
     pub output: OutputKind,
+    /// Cached image protocol state for plot entries (avoids re-encoding per frame).
+    pub image_state: RefCell<Option<StatefulProtocol>>,
+}
+
+impl Clone for WorksheetEntry {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            input: self.input.clone(),
+            output: self.output.clone(),
+            image_state: RefCell::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for WorksheetEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorksheetEntry")
+            .field("index", &self.index)
+            .field("input", &self.input)
+            .field("output", &self.output)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -14,6 +42,7 @@ pub enum OutputKind {
     Value(String),
     Error(String),
     PrintOutput(Vec<String>),
+    Plot(RenderedPlot),
 }
 
 impl WorksheetEntry {
@@ -40,6 +69,19 @@ impl WorksheetEntry {
                 }
                 result
             }
+            OutputKind::Plot(p) => {
+                let labels: Vec<&str> = p.spec.series.iter().map(|s| s.label.as_str()).collect();
+                vec![(format!("Out[{}]: [plot: {}]", self.index, labels.join(", ")), Theme::output_value())]
+            }
+        }
+    }
+
+    /// Number of text lines this entry occupies (for scrolling calculations).
+    /// Plot entries reserve PLOT_ROWS for the image.
+    pub fn line_count(&self) -> usize {
+        match &self.output {
+            OutputKind::Plot(_) => 1 + PLOT_ROWS as usize + 1, // input + image + blank
+            _ => 1 + self.output_lines().len() + 1, // input + output + blank
         }
     }
 }
@@ -70,6 +112,7 @@ impl WorksheetState {
                 index,
                 input: input.clone(),
                 output: OutputKind::PrintOutput(print_lines),
+                image_state: RefCell::new(None),
             });
         }
 
@@ -77,6 +120,7 @@ impl WorksheetState {
             index,
             input,
             output,
+            image_state: RefCell::new(None),
         });
     }
 
@@ -99,9 +143,6 @@ impl WorksheetState {
     }
 
     fn total_lines(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|e| 1 + e.output_lines().len() + 1) // input + output + blank line
-            .sum()
+        self.entries.iter().map(|e| e.line_count()).sum()
     }
 }

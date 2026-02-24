@@ -54,6 +54,11 @@ impl Env {
         }
     }
 
+    /// Remove a binding from this scope (does not affect parents).
+    pub fn remove(&mut self, name: &str) -> Option<Value> {
+        self.bindings.remove(name)
+    }
+
     /// Get all bindings visible from this scope (for the variable inspector).
     pub fn all_bindings(&self) -> Vec<(String, Value)> {
         let mut result = HashMap::new();

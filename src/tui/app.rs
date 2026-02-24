@@ -4,6 +4,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
+use ratatui_image::picker::Picker;
+use ratatui_image::StatefulImage;
 
 use crate::lang::builtins::{numeric_eval_sym, BUILTIN_CONSTANTS};
 use crate::lang::eval::Evaluator;
@@ -12,7 +14,7 @@ use crate::lang::parser::Parser;
 use crate::lang::types::{Function, Value};
 use crate::tui::hints::detect_active_function;
 use crate::tui::input::InputState;
-use crate::tui::output::{OutputKind, WorksheetState};
+use crate::tui::output::{OutputKind, WorksheetState, PLOT_ROWS};
 use crate::tui::status::render_status_bar;
 use crate::tui::theme::Theme;
 
@@ -21,15 +23,17 @@ pub struct App {
     pub worksheet: WorksheetState,
     pub evaluator: Evaluator,
     pub should_quit: bool,
+    pub picker: Option<Picker>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(picker: Option<Picker>) -> Self {
         Self {
             input: InputState::new(),
             worksheet: WorksheetState::new(),
             evaluator: Evaluator::new(),
             should_quit: false,
+            picker,
         }
     }
 
@@ -211,6 +215,13 @@ impl App {
         let print_lines = self.evaluator.output.clone();
 
         match result {
+            Ok(Value::Plot(rendered)) => {
+                self.worksheet.add_entry(
+                    input.to_string(),
+                    OutputKind::Plot(rendered),
+                    print_lines,
+                );
+            }
             Ok(value) => {
                 self.worksheet.add_entry(
                     input.to_string(),
@@ -232,7 +243,7 @@ impl App {
     }
 
     /// Render the full UI.
-    pub fn render(&self, frame: &mut Frame) {
+    pub fn render(&mut self, frame: &mut Frame) {
         let outer = Layout::vertical([
             Constraint::Length(1),  // Status bar
             Constraint::Min(5),    // Main area
@@ -255,7 +266,7 @@ impl App {
         self.render_input(frame, outer[2]);
     }
 
-    fn render_worksheet(&self, frame: &mut Frame, area: Rect) {
+    fn render_worksheet(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border_focused())
@@ -264,39 +275,154 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Build all lines
-        let mut lines: Vec<Line> = Vec::new();
-        for entry in &self.worksheet.entries {
+        // Build a flat list of render items with their heights
+        enum RenderItem {
+            TextLine(Line<'static>),
+            PlotImage(usize), // index into worksheet entries
+        }
+
+        let mut items: Vec<RenderItem> = Vec::new();
+        for (entry_idx, entry) in self.worksheet.entries.iter().enumerate() {
             // Input line
-            lines.push(Line::from(vec![
+            items.push(RenderItem::TextLine(Line::from(vec![
                 Span::styled(
                     format!(" In[{}]: ", entry.index),
                     Theme::input_prompt(),
                 ),
-                Span::styled(&entry.input, Theme::input_text()),
-            ]));
+                Span::styled(entry.input.clone(), Theme::input_text()),
+            ])));
 
-            // Output lines
-            for (text, style) in entry.output_lines() {
-                lines.push(Line::from(Span::styled(text, style)));
+            match &entry.output {
+                OutputKind::Plot(_) => {
+                    // Reserve PLOT_ROWS for image rendering
+                    items.push(RenderItem::PlotImage(entry_idx));
+                }
+                _ => {
+                    for (text, style) in entry.output_lines() {
+                        items.push(RenderItem::TextLine(Line::from(Span::styled(text, style))));
+                    }
+                }
             }
 
             // Blank separator
-            lines.push(Line::from(""));
+            items.push(RenderItem::TextLine(Line::from("")));
         }
 
-        // Handle scrolling
+        // Calculate total height
+        let total_height: usize = items.iter().map(|item| match item {
+            RenderItem::TextLine(_) => 1,
+            RenderItem::PlotImage(_) => PLOT_ROWS as usize,
+        }).sum();
+
+        // Auto-scroll to bottom
         let visible_height = inner.height as usize;
-        let total = lines.len();
-        let offset = if total > visible_height {
-            total.saturating_sub(visible_height) // auto-scroll to bottom
+        let offset = if total_height > visible_height {
+            total_height.saturating_sub(visible_height)
         } else {
             0
         };
 
-        let visible_lines: Vec<Line> = lines.into_iter().skip(offset).take(visible_height).collect();
-        let paragraph = Paragraph::new(visible_lines);
-        frame.render_widget(paragraph, inner);
+        // Render visible items
+        let mut y_pos: usize = 0;
+        for item in &items {
+            let item_height = match item {
+                RenderItem::TextLine(_) => 1,
+                RenderItem::PlotImage(_) => PLOT_ROWS as usize,
+            };
+
+            // Skip items before the scroll offset
+            if y_pos + item_height <= offset {
+                y_pos += item_height;
+                continue;
+            }
+            // Stop if past the visible area
+            if y_pos >= offset + visible_height {
+                break;
+            }
+
+            let render_y = (y_pos.saturating_sub(offset)) as u16;
+
+            match item {
+                RenderItem::TextLine(line) => {
+                    let line_area = Rect {
+                        x: inner.x,
+                        y: inner.y + render_y,
+                        width: inner.width,
+                        height: 1,
+                    };
+                    frame.render_widget(Paragraph::new(line.clone()), line_area);
+                }
+                RenderItem::PlotImage(entry_idx) => {
+                    let remaining = (inner.y + inner.height).saturating_sub(inner.y + render_y);
+                    let plot_h = remaining.min(PLOT_ROWS);
+                    if plot_h > 0 {
+                        let plot_area = Rect {
+                            x: inner.x,
+                            y: inner.y + render_y,
+                            width: inner.width,
+                            height: plot_h,
+                        };
+                        self.render_plot_image(frame, plot_area, *entry_idx);
+                    }
+                }
+            }
+
+            y_pos += item_height;
+        }
+    }
+
+    /// Render a plot image into the given area using ratatui-image.
+    fn render_plot_image(&self, frame: &mut Frame, area: Rect, entry_idx: usize) {
+        let entry = &self.worksheet.entries[entry_idx];
+        let png_bytes = match &entry.output {
+            OutputKind::Plot(p) => &p.png_bytes,
+            _ => return,
+        };
+
+        // Initialize image state if needed
+        let needs_init = entry.image_state.borrow().is_none();
+        if needs_init {
+            if let Some(picker) = &self.picker {
+                match image::load_from_memory(png_bytes) {
+                    Ok(dyn_image) => {
+                        let protocol = picker.new_resize_protocol(dyn_image);
+                        *entry.image_state.borrow_mut() = Some(protocol);
+                    }
+                    Err(e) => {
+                        // Fallback: show error text
+                        let text = format!("[plot decode error: {}]", e);
+                        frame.render_widget(
+                            Paragraph::new(Span::styled(text, Theme::error())),
+                            area,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // No picker — show fallback text
+                let labels: String = match &entry.output {
+                    OutputKind::Plot(p) => p.spec.series.iter()
+                        .map(|s| s.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => String::new(),
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("[plot: {} — image display requires Kitty/iTerm2]", labels),
+                        Theme::output_value(),
+                    )),
+                    area,
+                );
+                return;
+            }
+        }
+
+        let mut state = entry.image_state.borrow_mut();
+        if let Some(protocol) = state.as_mut() {
+            let image_widget = StatefulImage::default();
+            frame.render_stateful_widget(image_widget, area, protocol);
+        }
     }
 
     fn render_sidebar(&self, frame: &mut Frame, area: Rect) {

@@ -7,11 +7,15 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
 
 use aurita::tui::app::App;
 use aurita::tui::event::{poll_event, AppEvent};
 
 fn main() -> anyhow::Result<()> {
+    // Query terminal for image protocol support BEFORE entering alternate screen
+    let picker = Picker::from_query_stdio().ok();
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -20,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let result = run_app(&mut terminal);
+    let result = run_app(&mut terminal, picker);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -62,8 +66,8 @@ fn locate_bridge() -> Option<String> {
     None
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
-    let mut app = App::new();
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option<Picker>) -> anyhow::Result<()> {
+    let mut app = App::new(picker);
 
     // Try to locate and spawn the SymPy bridge
     let bridge_path = locate_bridge();
@@ -72,7 +76,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Res
     }
 
     loop {
-        terminal.draw(|frame| app.render(frame))?;
+        terminal.draw(|frame| app.render(frame))?; // render takes &mut self via app
 
         if let Some(event) = poll_event(Duration::from_millis(50)) {
             match event {

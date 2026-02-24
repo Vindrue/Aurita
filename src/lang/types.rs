@@ -1,5 +1,6 @@
 use crate::lang::ast::Expr;
 use crate::lang::env::EnvRef;
+use crate::plot::types::RenderedPlot;
 use crate::symbolic::expr::SymExpr;
 use std::fmt;
 
@@ -18,6 +19,8 @@ pub enum Value {
     Vector(Vec<Value>),
     /// A callable function.
     Function(Function),
+    /// A rendered plot image.
+    Plot(RenderedPlot),
     /// Unit value (result of statements with no return value).
     Unit,
 }
@@ -99,6 +102,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Vector(_) => "vector",
             Value::Function(_) => "function",
+            Value::Plot(_) => "plot",
             Value::Unit => "unit",
         }
     }
@@ -113,6 +117,7 @@ impl Value {
             Value::Vector(v) => !v.is_empty(),
             Value::Unit => false,
             Value::Function(_) => true,
+            Value::Plot(_) => true,
         }
     }
 
@@ -177,6 +182,10 @@ impl fmt::Display for Value {
             }
             Value::Function(Function::UserDefined { name, params, .. }) => {
                 write!(f, "{}({})", name, params.join(", "))
+            }
+            Value::Plot(p) => {
+                let labels: Vec<&str> = p.spec.series.iter().map(|s| s.label.as_str()).collect();
+                write!(f, "[plot: {}]", labels.join(", "))
             }
             Value::Unit => write!(f, "()"),
         }

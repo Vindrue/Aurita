@@ -8,6 +8,9 @@ using SymPy, and writes JSON responses to stdout.
 
 import sys
 import json
+import math
+import base64
+import io
 import traceback
 import sympy
 from sympy import (
@@ -15,10 +18,30 @@ from sympy import (
     sin, cos, tan, asin, acos, atan, sinh, cosh, tanh,
     exp, log, sqrt, Abs, sign, floor, ceiling,
     diff, integrate, limit, series, solve, simplify, expand, factor,
-    latex, refine, Piecewise,
+    latex, refine, Piecewise, lambdify,
 )
 from sympy.assumptions.ask import Q
 from sympy.assumptions.refine import refine
+
+# Lazy-loaded optional dependencies
+_np = None
+_plt = None
+
+def _get_numpy():
+    global _np
+    if _np is None:
+        import numpy
+        _np = numpy
+    return _np
+
+def _get_matplotlib():
+    global _plt
+    if _plt is None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        _plt = plt
+    return _plt
 
 
 # Cache symbols so they share assumptions within a session.
@@ -253,6 +276,88 @@ def expr_to_json(expr):
     return {"type": "Sym", "name": str(expr)}
 
 
+def handle_render_plot(req_id, params):
+    """Render a plot using matplotlib, return base64-encoded PNG."""
+    plt = _get_matplotlib()
+
+    series_data = params["series"]
+    x_min = params["x_min"]
+    x_max = params["x_max"]
+    dpi = params.get("dpi", 150)
+
+    # Figure size in inches — will produce a crisp image at the given DPI
+    fig_w = params.get("width", 800) / dpi
+    fig_h = params.get("height", 500) / dpi
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+    # Style: clean white background, light grid
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+    ax.set_xlim(x_min, x_max)
+
+    # Compute y-range from data with padding
+    all_y = []
+    for s in series_data:
+        for y in s["y"]:
+            if y is not None and math.isfinite(y):
+                all_y.append(y)
+
+    if all_y:
+        y_lo, y_hi = min(all_y), max(all_y)
+        # Clamp to avoid asymptote blowup
+        y_lo = max(y_lo, -1000.0)
+        y_hi = min(y_hi, 1000.0)
+        if abs(y_hi - y_lo) < 1e-10:
+            y_lo -= 1.0
+            y_hi += 1.0
+        pad = (y_hi - y_lo) * 0.08
+        ax.set_ylim(y_lo - pad, y_hi + pad)
+
+    # Plot each series — split at None values (discontinuities)
+    for s in series_data:
+        label = s.get("label", "")
+        xs = s["x"]
+        ys = s["y"]
+
+        # Split into continuous segments at None/NaN
+        seg_x, seg_y = [], []
+        first_segment = True
+        for x, y in zip(xs, ys):
+            if y is not None and math.isfinite(y):
+                seg_x.append(x)
+                seg_y.append(y)
+            else:
+                if seg_x:
+                    ax.plot(seg_x, seg_y, linewidth=1.5,
+                            label=label if first_segment else None)
+                    first_segment = False
+                    seg_x, seg_y = [], []
+        if seg_x:
+            ax.plot(seg_x, seg_y, linewidth=1.5,
+                    label=label if first_segment else None)
+
+    # Legend for multiple curves
+    if len(series_data) > 1:
+        ax.legend(fontsize=8, loc="best", framealpha=0.8)
+
+    # Axis labels: minimal tick styling
+    ax.tick_params(labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.5)
+
+    fig.tight_layout(pad=0.5)
+
+    # Render to PNG bytes
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
+
+    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {"id": req_id, "status": "ok", "png_base64": png_b64}
+
+
 def handle_request(req):
     """Process a single CAS request and return a response dict."""
     req_id = req["id"]
@@ -353,6 +458,52 @@ def handle_request(req):
             expr = expr_from_json(params["expr"])
             result = latex(expr)
             return {"id": req_id, "status": "ok", "result": {"type": "Sym", "name": result}, "latex": result}
+
+        elif op_name == "lambdify":
+            expr = expr_from_json(params["expr"])
+            var = get_symbol(params["var"], real=True)
+            x_values = params["x_values"]
+
+            # Try fast vectorized evaluation via numpy first
+            y_values = None
+            try:
+                np = _get_numpy()
+                f = lambdify(var, expr, "numpy")
+                x_arr = np.array(x_values, dtype=np.float64)
+                y_arr = f(x_arr)
+                if np.isscalar(y_arr):
+                    y_arr = np.full_like(x_arr, float(y_arr))
+                y_arr = np.asarray(y_arr, dtype=np.float64)
+                y_values = []
+                for y in y_arr:
+                    if math.isfinite(y):
+                        y_values.append(float(y))
+                    else:
+                        y_values.append(None)
+                # Check if we actually got results (not all None)
+                if all(v is None for v in y_values):
+                    y_values = None
+            except Exception:
+                y_values = None
+
+            # Fallback: element-wise SymPy evaluation (slower but handles all functions)
+            if y_values is None:
+                y_values = []
+                for x_val in x_values:
+                    try:
+                        result = expr.subs(var, x_val).evalf()
+                        y = float(result)
+                        if math.isfinite(y):
+                            y_values.append(y)
+                        else:
+                            y_values.append(None)
+                    except Exception:
+                        y_values.append(None)
+
+            return {"id": req_id, "status": "ok", "y_values": y_values}
+
+        elif op_name == "render_plot":
+            return handle_render_plot(req_id, params)
 
         else:
             return {"id": req_id, "status": "error", "error": f"unknown operation: {op_name}"}

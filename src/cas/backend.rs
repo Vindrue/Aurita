@@ -1,5 +1,6 @@
-use crate::cas::protocol::{CasOp, CasRequest, CasResponse};
+use crate::cas::protocol::{CasOp, CasRequest, CasResponse, PlotSeriesData};
 use crate::symbolic::expr::SymExpr;
+use base64::Engine;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
@@ -154,6 +155,51 @@ impl CasBackend {
             order,
         })?;
         resp.into_result()
+    }
+
+    /// Render a plot via matplotlib, returning PNG bytes.
+    pub fn render_plot(
+        &mut self,
+        series: Vec<PlotSeriesData>,
+        x_min: f64,
+        x_max: f64,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) -> Result<Vec<u8>, String> {
+        let resp = self.request(CasOp::RenderPlot {
+            series,
+            x_min,
+            x_max,
+            width,
+            height,
+            dpi,
+        })?;
+        if !resp.is_ok() {
+            return Err(resp.error.unwrap_or_else(|| "unknown error".to_string()));
+        }
+        let b64 = resp.png_base64.ok_or("backend returned ok but no png_base64")?;
+        base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| format!("base64 decode: {}", e))
+    }
+
+    /// Convenience: lambdify + evaluate at given x-values.
+    pub fn lambdify_eval(
+        &mut self,
+        expr: &SymExpr,
+        var: &str,
+        x_values: &[f64],
+    ) -> Result<Vec<Option<f64>>, String> {
+        let resp = self.request(CasOp::Lambdify {
+            expr: expr.clone(),
+            var: var.to_string(),
+            x_values: x_values.to_vec(),
+        })?;
+        if !resp.is_ok() {
+            return Err(resp.error.unwrap_or_else(|| "unknown error".to_string()));
+        }
+        resp.y_values.ok_or_else(|| "backend returned ok but no y_values".to_string())
     }
 
     /// Check if the backend process is still running.

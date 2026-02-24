@@ -13,7 +13,7 @@ pub struct FuncHint {
 pub static FUNCTION_HINTS: &[FuncHint] = &[
     // CAS operations
     FuncHint { name: "dif",      signature: "dif(expr, var?, order?)",         description: "Differentiate expression" },
-    FuncHint { name: "int",      signature: "int(expr, var?, lo?, hi?)",       description: "Integrate expression" },
+    FuncHint { name: "int",      signature: "int(expr, var?, lo..hi or lo, hi)", description: "Integrate expression" },
     FuncHint { name: "solve",    signature: "solve(expr, var?)",               description: "Solve equation for variable" },
     FuncHint { name: "simplify", signature: "simplify(expr)",                  description: "Simplify expression" },
     FuncHint { name: "expand",   signature: "expand(expr)",                    description: "Expand expression" },
@@ -21,6 +21,8 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "lim",      signature: "lim(expr, var, point, dir?)",     description: "Compute limit" },
     FuncHint { name: "taylor",   signature: "taylor(expr, var, point, order?)", description: "Taylor series expansion" },
     FuncHint { name: "tex",      signature: "tex(expr)",                       description: "Convert to LaTeX string" },
+    // Plot
+    FuncHint { name: "plot",     signature: "plot(expr, range?) or plot([e1, e2, ...], range?)", description: "Plot expression(s)" },
     // Numeric eval
     FuncHint { name: "eval",     signature: "eval(expr)",                      description: "Force numeric evaluation" },
     // Math (1 arg)

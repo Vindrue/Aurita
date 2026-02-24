@@ -52,6 +52,29 @@ pub enum CasOp {
     },
     #[serde(rename = "latex")]
     Latex { expr: SymExpr },
+    #[serde(rename = "lambdify")]
+    Lambdify {
+        expr: SymExpr,
+        var: String,
+        x_values: Vec<f64>,
+    },
+    #[serde(rename = "render_plot")]
+    RenderPlot {
+        series: Vec<PlotSeriesData>,
+        x_min: f64,
+        x_max: f64,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    },
+}
+
+/// Series data for the render_plot CAS operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlotSeriesData {
+    pub label: String,
+    pub x: Vec<f64>,
+    pub y: Vec<Option<f64>>,
 }
 
 /// A response from a CAS backend.
@@ -65,6 +88,10 @@ pub struct CasResponse {
     pub results: Option<Vec<SymExpr>>,
     /// LaTeX string
     pub latex: Option<String>,
+    /// Numeric y-values from lambdify evaluation
+    pub y_values: Option<Vec<Option<f64>>>,
+    /// Base64-encoded PNG from render_plot
+    pub png_base64: Option<String>,
 }
 
 impl CasResponse {
