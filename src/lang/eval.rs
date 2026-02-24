@@ -1,5 +1,5 @@
-use crate::cas::backend::CasBackend;
-use crate::cas::protocol::{CasOp, PlotSeriesData};
+use crate::cas::manager::{CasManager, CasResult, RoutingMode};
+use crate::cas::protocol::PlotSeriesData;
 use crate::lang::ast::*;
 use crate::lang::builtins::{numeric_eval_sym, register_builtins};
 use crate::lang::env::{Env, EnvRef};
@@ -23,8 +23,8 @@ pub struct Evaluator {
     pub env: EnvRef,
     /// Output lines captured from `print()` calls.
     pub output: Vec<String>,
-    /// Optional CAS backend for symbolic operations.
-    pub cas: Option<CasBackend>,
+    /// Optional CAS manager for symbolic operations (multiple backends).
+    pub cas_manager: Option<CasManager>,
 }
 
 impl Evaluator {
@@ -34,24 +34,38 @@ impl Evaluator {
         Self {
             env,
             output: Vec::new(),
-            cas: None,
+            cas_manager: None,
         }
     }
 
-    /// Try to connect to the SymPy backend.
-    pub fn init_cas(&mut self, bridge_path: &str) {
-        match CasBackend::spawn("sympy", "python3", &[bridge_path]) {
-            Ok(backend) => {
-                self.cas = Some(backend);
+    /// Initialize CAS backends.
+    pub fn init_cas(&mut self, sympy_bridge: Option<&str>, maxima_bridge: Option<&str>) {
+        let mut manager = CasManager::new();
+        if let Some(path) = sympy_bridge {
+            if let Err(e) = manager.add_backend("sympy", "python3", &[path]) {
+                self.output.push(format!("Warning: SymPy unavailable: {}", e));
             }
-            Err(e) => {
-                self.output.push(format!("Warning: CAS backend unavailable: {}", e));
+        }
+        if let Some(path) = maxima_bridge {
+            if let Err(e) = manager.add_backend("maxima", "python3", &[path]) {
+                self.output.push(format!("Warning: Maxima unavailable: {}", e));
             }
+        }
+        if manager.has_any_backend() {
+            self.cas_manager = Some(manager);
         }
     }
 
     pub fn has_cas(&self) -> bool {
-        self.cas.is_some()
+        self.cas_manager.is_some()
+    }
+
+    /// Get the CAS status string for the status bar.
+    pub fn cas_status(&self) -> String {
+        match &self.cas_manager {
+            Some(m) => m.status_display(),
+            None => "Numeric".to_string(),
+        }
     }
 
     /// Evaluate a program (list of statements). Returns the value of the last expression.
@@ -522,18 +536,112 @@ impl Evaluator {
             "taylor" => Ok(Some(self.cas_taylor(args, span)?)),
             "tex" => Ok(Some(self.cas_latex(args, span)?)),
             "plot" => Ok(Some(self.eval_plot(args, span)?)),
+            "backend" => Ok(Some(self.set_backend(args, span)?)),
+            "using" => Ok(Some(self.eval_using(args, span)?)),
             _ => Ok(None),
         }
     }
 
     fn require_cas(&self, op_name: &str, span: Span) -> LangResult<()> {
-        if self.cas.is_none() {
+        if self.cas_manager.is_none() {
             Err(LangError::eval(format!(
                 "{}: CAS backend not available (is Python/SymPy installed?)", op_name
             )).with_span(span))
         } else {
             Ok(())
         }
+    }
+
+    /// Convert a CasResult to a Value.
+    fn cas_result_to_value(&self, result: CasResult) -> Value {
+        match result {
+            CasResult::Single(expr) | CasResult::Agreed(expr) => Value::Symbolic(expr),
+            CasResult::Multiple(exprs) | CasResult::AgreedMultiple(exprs) => {
+                if exprs.len() == 1 {
+                    Value::Symbolic(exprs.into_iter().next().unwrap())
+                } else {
+                    Value::Vector(exprs.into_iter().map(Value::Symbolic).collect())
+                }
+            }
+            CasResult::Latex(s) => Value::Str(s),
+            CasResult::Disagreed { results } => {
+                let parts: Vec<String> = results
+                    .iter()
+                    .map(|(name, expr)| format!("{}: {}", name, expr))
+                    .collect();
+                Value::Str(parts.join(" | "))
+            }
+            CasResult::DisagreedMultiple { results } => {
+                let parts: Vec<String> = results
+                    .iter()
+                    .map(|(name, exprs)| {
+                        let vals: Vec<String> = exprs.iter().map(|e| format!("{}", e)).collect();
+                        format!("{}: [{}]", name, vals.join(", "))
+                    })
+                    .collect();
+                Value::Str(parts.join(" | "))
+            }
+        }
+    }
+
+    /// Set the active CAS backend: backend("sympy"), backend("maxima"), backend("both")
+    fn set_backend(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("backend", span)?;
+        if args.len() != 1 {
+            return Err(LangError::arity("backend: expected 1 argument: backend(\"sympy\"|\"maxima\"|\"both\")").with_span(span));
+        }
+        let val = self.eval_expr(&args[0])?;
+        let name = match &val {
+            Value::Str(s) => s.clone(),
+            Value::Symbolic(SymExpr::Sym { name }) => name.clone(),
+            _ => return Err(LangError::type_err("backend: argument must be a string").with_span(span)),
+        };
+
+        let mode = match name.as_str() {
+            "both" => RoutingMode::Both,
+            other => RoutingMode::Single(other.to_string()),
+        };
+
+        let manager = self.cas_manager.as_mut().unwrap();
+        manager.set_routing(mode)
+            .map_err(|e| LangError::eval(format!("backend: {}", e)).with_span(span))?;
+
+        Ok(Value::Str(format!("Backend set to {}", manager.status_display())))
+    }
+
+    /// Evaluate an expression with a specific backend: using("maxima", dif(x^2, x))
+    fn eval_using(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("using", span)?;
+        if args.len() != 2 {
+            return Err(LangError::arity("using: expected 2 arguments: using(\"backend\", expr)").with_span(span));
+        }
+
+        // Evaluate first arg to get backend name
+        let val = self.eval_expr(&args[0])?;
+        let name = match &val {
+            Value::Str(s) => s.clone(),
+            Value::Symbolic(SymExpr::Sym { name }) => name.clone(),
+            _ => return Err(LangError::type_err("using: first argument must be a backend name string").with_span(span)),
+        };
+
+        let manager = self.cas_manager.as_mut().unwrap();
+        let saved_routing = manager.routing.clone();
+
+        let mode = match name.as_str() {
+            "both" => RoutingMode::Both,
+            other => RoutingMode::Single(other.to_string()),
+        };
+        manager.set_routing(mode)
+            .map_err(|e| LangError::eval(format!("using: {}", e)).with_span(span))?;
+
+        // Evaluate the expression (lazy — args[1] is unevaluated AST)
+        let result = self.eval_expr(&args[1]);
+
+        // Restore routing
+        let manager = self.cas_manager.as_mut().unwrap();
+        manager.routing = saved_routing;
+
+        result
     }
 
     fn cas_differentiate(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -574,11 +682,11 @@ impl Evaluator {
             1
         };
 
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.differentiate(&sym_expr, &var, order)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.differentiate(&sym_expr, &var, order)
             .map_err(|e| LangError::eval(format!("dif: {}", e)).with_span(span))?;
 
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_integrate(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -636,11 +744,11 @@ impl Evaluator {
             (None, None)
         };
 
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.integrate(&sym_expr, &var, lower.as_ref(), upper.as_ref())
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.integrate(&sym_expr, &var, lower.as_ref(), upper.as_ref())
             .map_err(|e| LangError::eval(format!("int: {}", e)).with_span(span))?;
 
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_solve(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -702,15 +810,11 @@ impl Evaluator {
             ).with_span(span));
         };
 
-        let cas = self.cas.as_mut().unwrap();
-        let results = cas.solve(&equations, &vars)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.solve(&equations, &vars)
             .map_err(|e| LangError::eval(format!("solve: {}", e)).with_span(span))?;
 
-        if results.len() == 1 {
-            Ok(Value::Symbolic(results.into_iter().next().unwrap()))
-        } else {
-            Ok(Value::Vector(results.into_iter().map(Value::Symbolic).collect()))
-        }
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_simplify(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -722,10 +826,10 @@ impl Evaluator {
         let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
             LangError::type_err("simplify: argument must be symbolic").with_span(span)
         })?;
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.simplify(&sym_expr)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.simplify(&sym_expr)
             .map_err(|e| LangError::eval(format!("simplify: {}", e)).with_span(span))?;
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_expand(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -737,10 +841,10 @@ impl Evaluator {
         let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
             LangError::type_err("expand: argument must be symbolic").with_span(span)
         })?;
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.expand(&sym_expr)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.expand(&sym_expr)
             .map_err(|e| LangError::eval(format!("expand: {}", e)).with_span(span))?;
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_factor(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -752,10 +856,10 @@ impl Evaluator {
         let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
             LangError::type_err("factor: argument must be symbolic").with_span(span)
         })?;
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.factor(&sym_expr)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.factor(&sym_expr)
             .map_err(|e| LangError::eval(format!("factor: {}", e)).with_span(span))?;
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_limit(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -783,10 +887,10 @@ impl Evaluator {
             None
         };
 
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.limit(&sym_expr, &var, &point, dir.as_deref())
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.limit(&sym_expr, &var, &point, dir.as_deref())
             .map_err(|e| LangError::eval(format!("lim: {}", e)).with_span(span))?;
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_taylor(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -813,10 +917,10 @@ impl Evaluator {
             5
         };
 
-        let cas = self.cas.as_mut().unwrap();
-        let result = cas.taylor(&sym_expr, &var, &point, order)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.taylor(&sym_expr, &var, &point, order)
             .map_err(|e| LangError::eval(format!("taylor: {}", e)).with_span(span))?;
-        Ok(Value::Symbolic(result))
+        Ok(self.cas_result_to_value(result))
     }
 
     fn cas_latex(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -828,11 +932,10 @@ impl Evaluator {
         let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
             LangError::type_err("tex: argument must be symbolic").with_span(span)
         })?;
-        let cas = self.cas.as_mut().unwrap();
-        let resp = cas.request(CasOp::Latex { expr: sym_expr })
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.latex(&sym_expr)
             .map_err(|e| LangError::eval(format!("tex: {}", e)).with_span(span))?;
-        let latex_str = resp.latex.unwrap_or_else(|| "?".to_string());
-        Ok(Value::Str(latex_str))
+        Ok(self.cas_result_to_value(result))
     }
 
     // --- Plotting ---
@@ -911,7 +1014,7 @@ impl Evaluator {
         };
 
         // Prefer matplotlib rendering via CAS backend
-        if self.cas.is_some() {
+        if self.cas_manager.is_some() {
             match self.render_plot_matplotlib(&spec, span) {
                 Ok(rendered) => return Ok(Value::Plot(rendered)),
                 Err(_) => {} // fall through to plotters
@@ -987,7 +1090,7 @@ impl Evaluator {
         }
 
         // If too few valid points and CAS is available, try lambdify fallback
-        if valid_count * 4 < n && self.cas.is_some() {
+        if valid_count * 4 < n && self.cas_manager.is_some() {
             if let Ok(cas_points) = self.cas_lambdify_sample(expr, var, x_min, x_max, n, span) {
                 let cas_valid = cas_points.iter().filter(|p| p.is_some()).count();
                 if cas_valid > valid_count {
@@ -1026,8 +1129,8 @@ impl Evaluator {
             .map(|i| x_min + (x_max - x_min) * i as f64 / (n - 1) as f64)
             .collect();
 
-        let cas = self.cas.as_mut().unwrap();
-        let y_values = cas.lambdify_eval(&sym_expr, var, &x_values)
+        let manager = self.cas_manager.as_mut().unwrap();
+        let y_values = manager.lambdify_eval(&sym_expr, var, &x_values)
             .map_err(|e| LangError::eval(format!("plot CAS fallback: {}", e)).with_span(span))?;
 
         let points: Vec<Option<(f64, f64)>> = x_values
@@ -1050,7 +1153,7 @@ impl Evaluator {
 
     /// Render a PlotSpec via the CAS backend (matplotlib).
     fn render_plot_matplotlib(&mut self, spec: &PlotSpec, span: Span) -> LangResult<RenderedPlot> {
-        let cas = self.cas.as_mut().unwrap();
+        let manager = self.cas_manager.as_mut().unwrap();
 
         // Convert Series to PlotSeriesData (split points into separate x/y arrays)
         let series_data: Vec<PlotSeriesData> = spec.series.iter().map(|s| {
@@ -1080,7 +1183,7 @@ impl Evaluator {
             }
         }).collect();
 
-        let png_bytes = cas.render_plot(
+        let png_bytes = manager.render_plot(
             series_data,
             spec.x_min,
             spec.x_max,

@@ -1,7 +1,8 @@
-//! Integration tests: full evaluator + SymPy CAS backend.
+//! Integration tests: full evaluator + CAS backends.
 //!
 //! These tests require Python 3 + SymPy to be installed.
-//! They spawn the actual python_bridge.py subprocess.
+//! Maxima tests additionally require Maxima to be installed.
+//! They spawn the actual bridge subprocesses.
 
 use aurita::lang::eval::Evaluator;
 use aurita::lang::lexer::Lexer;
@@ -10,8 +11,8 @@ use aurita::lang::types::Value;
 
 fn eval_with_cas(input: &str) -> Result<Value, String> {
     let mut evaluator = Evaluator::new();
-    let bridge = "backends/python_bridge.py";
-    evaluator.init_cas(bridge);
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
     assert!(evaluator.has_cas(), "CAS backend failed to start — is SymPy installed?");
 
     let tokens = Lexer::new(input).tokenize().map_err(|e| e.message)?;
@@ -22,6 +23,41 @@ fn eval_with_cas(input: &str) -> Result<Value, String> {
 fn eval_str(input: &str) -> String {
     format!("{}", eval_with_cas(input).unwrap())
 }
+
+/// Create an evaluator with both SymPy and Maxima (if available).
+#[allow(dead_code)]
+fn eval_with_both(input: &str) -> Result<Value, String> {
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    let maxima_bridge = "backends/maxima_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), Some(maxima_bridge));
+    assert!(evaluator.has_cas(), "No CAS backend available");
+
+    let tokens = Lexer::new(input).tokenize().map_err(|e| e.message)?;
+    let stmts = Parser::new(tokens).parse_program().map_err(|e| e.message)?;
+    evaluator.eval_program(&stmts).map_err(|e| e.message)
+}
+
+/// Run multiple expressions on one evaluator with both backends.
+fn eval_multi_with_both(inputs: &[&str]) -> Result<Vec<Value>, String> {
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    let maxima_bridge = "backends/maxima_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), Some(maxima_bridge));
+    assert!(evaluator.has_cas(), "No CAS backend available");
+
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = Lexer::new(input).tokenize().map_err(|e| e.message)?;
+        let stmts = Parser::new(tokens).parse_program().map_err(|e| e.message)?;
+        results.push(evaluator.eval_program(&stmts).map_err(|e| e.message)?);
+    }
+    Ok(results)
+}
+
+// =============================================================================
+// Existing SymPy tests (unchanged behavior)
+// =============================================================================
 
 #[test]
 fn test_cas_differentiate() {
@@ -119,7 +155,6 @@ fn test_sin_pi_evaluates_numerically() {
 #[test]
 fn test_gaussian_definite_integral() {
     // Gaussian integral: int(e^(-a*x^2), x, -inf, inf) = sqrt(pi/a)
-    // Note: must write "a*x^2" or "a x^2", NOT "ax^2" (ax is one identifier)
     let result = eval_str("int(e^(-a*x^2), x, -inf, inf)");
     assert!(result.contains("sqrt") && result.contains("pi"),
         "Expected sqrt(pi/a) or similar, got: {}", result);
@@ -251,4 +286,128 @@ fn test_plot_discontinuity_detection() {
         Ok(other) => panic!("Expected plot, got: {}", other),
         Err(e) => panic!("Plot failed: {}", e),
     }
+}
+
+// =============================================================================
+// Maxima tests (require Maxima to be installed)
+// =============================================================================
+
+fn has_maxima() -> bool {
+    std::process::Command::new("maxima")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn eval_maxima(input: &str) -> Result<Value, String> {
+    let results = eval_multi_with_both(&[
+        "backend(\"maxima\")",
+        input,
+    ])?;
+    Ok(results.into_iter().last().unwrap())
+}
+
+fn eval_maxima_str(input: &str) -> String {
+    format!("{}", eval_maxima(input).unwrap())
+}
+
+#[test]
+fn test_maxima_differentiate() {
+    if !has_maxima() { return; }
+    let result = eval_maxima_str("dif(x^2, x)");
+    assert_eq!(result, "2*x");
+}
+
+#[test]
+fn test_maxima_integrate() {
+    if !has_maxima() { return; }
+    let result = eval_maxima_str("int(sin(x), x)");
+    assert_eq!(result, "-cos(x)");
+}
+
+#[test]
+fn test_maxima_solve() {
+    if !has_maxima() { return; }
+    let result = eval_maxima_str("solve(x^2 - 4, x)");
+    assert!(result.contains("-2") && result.contains("2"),
+        "Expected solutions containing -2 and 2, got: {}", result);
+}
+
+#[test]
+fn test_maxima_simplify() {
+    if !has_maxima() { return; }
+    let result = eval_maxima_str("simplify(x^2 + 2x + 1)");
+    // ratsimp should produce (x+1)^2 or x^2+2*x+1
+    assert!(result.contains("x"),
+        "Expected expression with x, got: {}", result);
+}
+
+// =============================================================================
+// Backend switching tests
+// =============================================================================
+
+#[test]
+fn test_backend_set() {
+    let results = eval_multi_with_both(&[
+        "backend(\"sympy\")",
+        "dif(x^2, x)",
+    ]).unwrap();
+    let diff_result = format!("{}", results[1]);
+    assert_eq!(diff_result, "2*x");
+
+    // Setting should return confirmation
+    let set_result = format!("{}", results[0]);
+    assert!(set_result.contains("Sympy") || set_result.contains("SymPy") || set_result.contains("sympy"),
+        "Expected confirmation message, got: {}", set_result);
+}
+
+#[test]
+fn test_using_override() {
+    if !has_maxima() { return; }
+    // Default is sympy; using("maxima", ...) should work
+    let results = eval_multi_with_both(&[
+        "using(\"maxima\", dif(x^2, x))",
+        "dif(x^2, x)",  // should still use default (sympy)
+    ]).unwrap();
+
+    let maxima_result = format!("{}", results[0]);
+    assert_eq!(maxima_result, "2*x");
+
+    let sympy_result = format!("{}", results[1]);
+    assert_eq!(sympy_result, "2*x");
+}
+
+// =============================================================================
+// Both mode tests
+// =============================================================================
+
+#[test]
+fn test_both_mode_agree() {
+    if !has_maxima() { return; }
+    let results = eval_multi_with_both(&[
+        "backend(\"both\")",
+        "dif(x^2, x)",
+    ]).unwrap();
+
+    let diff_result = format!("{}", results[1]);
+    // Both backends should agree → single result "2*x"
+    assert_eq!(diff_result, "2*x");
+}
+
+// =============================================================================
+// Cache tests
+// =============================================================================
+
+#[test]
+fn test_cache_correctness() {
+    // Same operation twice should give the same result (and the second hit the cache)
+    let results = eval_multi_with_both(&[
+        "dif(x^3, x)",
+        "dif(x^3, x)",
+    ]).unwrap();
+
+    let r1 = format!("{}", results[0]);
+    let r2 = format!("{}", results[1]);
+    assert_eq!(r1, r2, "Cached result should match: {} vs {}", r1, r2);
+    assert_eq!(r1, "3*x^2");
 }

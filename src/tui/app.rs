@@ -252,7 +252,8 @@ impl App {
         .split(frame.area());
 
         // Status bar
-        render_status_bar(frame, outer[0], self.evaluator.has_cas());
+        let cas_status = self.evaluator.cas_status();
+        render_status_bar(frame, outer[0], &cas_status);
 
         // Main area: worksheet + sidebar
         let main = Layout::horizontal([

@@ -25,6 +25,9 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "plot",     signature: "plot(expr, range?) or plot([e1, e2, ...], range?)", description: "Plot expression(s)" },
     // Numeric eval
     FuncHint { name: "eval",     signature: "eval(expr)",                      description: "Force numeric evaluation" },
+    // Backend control
+    FuncHint { name: "backend",  signature: "backend(\"sympy\"|\"maxima\"|\"both\")", description: "Set active CAS backend" },
+    FuncHint { name: "using",    signature: "using(\"backend\", expr)",        description: "Evaluate with specific backend" },
     // Math (1 arg)
     FuncHint { name: "sin",      signature: "sin(x)",     description: "Sine" },
     FuncHint { name: "cos",      signature: "cos(x)",     description: "Cosine" },

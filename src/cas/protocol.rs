@@ -2,14 +2,14 @@ use crate::symbolic::expr::SymExpr;
 use serde::{Deserialize, Serialize};
 
 /// A request sent to a CAS backend.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CasRequest {
     pub id: u64,
     pub op: CasOp,
 }
 
 /// The operation to perform.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", content = "params")]
 pub enum CasOp {
     #[serde(rename = "differentiate")]
@@ -78,7 +78,7 @@ pub struct PlotSeriesData {
 }
 
 /// A response from a CAS backend.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CasResponse {
     pub id: u64,
     pub status: String,

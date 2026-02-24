@@ -38,26 +38,29 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate the Python bridge script relative to the executable or in known paths.
-fn locate_bridge() -> Option<String> {
+/// Locate a bridge script by name relative to the executable or in known paths.
+fn locate_bridge(name: &str) -> Option<String> {
+    let filename = format!("{}.py", name);
+
     // 1. Next to the executable
     if let Ok(exe) = std::env::current_exe() {
-        let dir = exe.parent()?;
-        let candidate = dir.join("../backends/python_bridge.py");
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().to_string());
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(format!("../backends/{}", filename));
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
 
     // 2. Current working directory
-    let cwd_candidate = std::path::Path::new("backends/python_bridge.py");
+    let cwd_candidate = std::path::Path::new("backends").join(&filename);
     if cwd_candidate.exists() {
         return Some(cwd_candidate.to_string_lossy().to_string());
     }
 
     // 3. Cargo manifest directory (development)
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let candidate = std::path::Path::new(&manifest_dir).join("backends/python_bridge.py");
+        let candidate = std::path::Path::new(&manifest_dir).join("backends").join(&filename);
         if candidate.exists() {
             return Some(candidate.to_string_lossy().to_string());
         }
@@ -69,11 +72,14 @@ fn locate_bridge() -> Option<String> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option<Picker>) -> anyhow::Result<()> {
     let mut app = App::new(picker);
 
-    // Try to locate and spawn the SymPy bridge
-    let bridge_path = locate_bridge();
-    if let Some(path) = &bridge_path {
-        app.evaluator.init_cas(path);
-    }
+    // Locate bridge scripts
+    let sympy_bridge = locate_bridge("python_bridge");
+    let maxima_bridge = locate_bridge("maxima_bridge");
+
+    app.evaluator.init_cas(
+        sympy_bridge.as_deref(),
+        maxima_bridge.as_deref(),
+    );
 
     loop {
         terminal.draw(|frame| app.render(frame))?; // render takes &mut self via app

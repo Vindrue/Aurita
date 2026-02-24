@@ -28,6 +28,9 @@ anyhow = "1"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "bitmap_encoder"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Caching
+lru = "0.12"
+
 # Unicode
 unicode-width = "0.2"
 

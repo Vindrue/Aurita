@@ -1,1 +1,1 @@
-// CAS operation router (Phase 5+)
+// Routing logic is implemented in CasManager (src/cas/manager.rs).
