@@ -68,6 +68,17 @@ impl Evaluator {
         }
     }
 
+    /// Set the CAS backend by name (for config/startup use).
+    pub fn set_backend_str(&mut self, name: &str) {
+        if let Some(ref mut manager) = self.cas_manager {
+            let mode = match name {
+                "both" => crate::cas::manager::RoutingMode::Both,
+                other => crate::cas::manager::RoutingMode::Single(other.to_string()),
+            };
+            let _ = manager.set_routing(mode);
+        }
+    }
+
     /// Evaluate a program (list of statements). Returns the value of the last expression.
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> LangResult<Value> {
         let mut last = Value::Unit;

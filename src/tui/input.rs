@@ -13,11 +13,11 @@ pub struct InputState {
 }
 
 impl InputState {
-    pub fn new() -> Self {
+    pub fn new(history: Vec<String>) -> Self {
         Self {
             text: String::new(),
             cursor: 0,
-            history: Vec::new(),
+            history,
             history_pos: None,
             saved_input: String::new(),
         }
@@ -129,6 +129,12 @@ impl InputState {
 
     pub fn kill_line(&mut self) {
         self.text.truncate(self.cursor);
+    }
+
+    /// Replace bytes [start..end) with `replacement` and update cursor.
+    pub fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+        self.text.replace_range(start..end, replacement);
+        self.cursor = start + replacement.len();
     }
 
     pub fn kill_word_back(&mut self) {

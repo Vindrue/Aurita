@@ -34,5 +34,9 @@ lru = "0.12"
 # Unicode
 unicode-width = "0.2"
 
+# Persistence
+dirs = "6"
+toml = "0.8"
+
 [dev-dependencies]
 pretty_assertions = "1"

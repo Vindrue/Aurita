@@ -9,6 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 
+use aurita::persistence;
 use aurita::tui::app::App;
 use aurita::tui::event::{poll_event, AppEvent};
 
@@ -70,7 +71,9 @@ fn locate_bridge(name: &str) -> Option<String> {
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option<Picker>) -> anyhow::Result<()> {
-    let mut app = App::new(picker);
+    let config = persistence::config::load_config();
+    let history = persistence::history::load_history();
+    let mut app = App::new(picker, history, config);
 
     // Locate bridge scripts
     let sympy_bridge = locate_bridge("python_bridge");
@@ -80,6 +83,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option
         sympy_bridge.as_deref(),
         maxima_bridge.as_deref(),
     );
+
+    // Apply default backend from config
+    if app.config.default_backend != "sympy" {
+        app.evaluator.set_backend_str(&app.config.default_backend);
+    }
 
     loop {
         terminal.draw(|frame| app.render(frame))?; // render takes &mut self via app
@@ -100,6 +108,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option
             break;
         }
     }
+
+    // Save history on quit (full dedup + trim to limit)
+    persistence::history::save_history(&app.input.history);
 
     Ok(())
 }

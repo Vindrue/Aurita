@@ -1,21 +1,24 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::StatefulImage;
 
 use crate::lang::builtins::{numeric_eval_sym, BUILTIN_CONSTANTS};
+use crate::persistence;
 use crate::physics::constants;
 use crate::lang::eval::Evaluator;
 use crate::lang::lexer::Lexer;
 use crate::lang::parser::Parser;
 use crate::lang::types::{Function, Value};
+use crate::tui::completion::CompletionState;
+use crate::tui::help::HelpPanel;
 use crate::tui::hints::detect_active_function;
 use crate::tui::input::InputState;
-use crate::tui::output::{OutputKind, WorksheetState, PLOT_ROWS};
+use crate::tui::output::{OutputKind, WorksheetState};
 use crate::tui::status::render_status_bar;
 use crate::tui::theme::Theme;
 
@@ -25,21 +28,121 @@ pub struct App {
     pub evaluator: Evaluator,
     pub should_quit: bool,
     pub picker: Option<Picker>,
+    pub completion: CompletionState,
+    pub help: HelpPanel,
+    pub session_name: Option<String>,
+    pub config: persistence::config::Config,
 }
 
 impl App {
-    pub fn new(picker: Option<Picker>) -> Self {
+    pub fn new(picker: Option<Picker>, history: Vec<String>, config: persistence::config::Config) -> Self {
         Self {
-            input: InputState::new(),
+            input: InputState::new(history),
             worksheet: WorksheetState::new(),
             evaluator: Evaluator::new(),
             should_quit: false,
             picker,
+            completion: CompletionState::new(),
+            help: HelpPanel::new(),
+            session_name: None,
+            config,
         }
     }
 
     /// Handle a key event. Returns true if the screen should be redrawn.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Help panel mode
+        if self.help.visible {
+            return self.handle_key_help(key);
+        }
+
+        // Completion mode: intercept keys for the popup
+        if self.completion.active {
+            return self.handle_key_completion(key);
+        }
+
+        self.handle_key_normal(key)
+    }
+
+    /// Key handling when the help panel is visible.
+    fn handle_key_help(&mut self, key: KeyEvent) -> bool {
+        match key {
+            KeyEvent { code: KeyCode::Esc, .. }
+            | KeyEvent { code: KeyCode::Char('h'), modifiers: KeyModifiers::CONTROL, .. }
+            | KeyEvent { code: KeyCode::F(1), .. } => {
+                self.help.toggle();
+                true
+            }
+            KeyEvent { code: KeyCode::Up, .. } | KeyEvent { code: KeyCode::Char('k'), .. } => {
+                self.help.scroll_up(1);
+                true
+            }
+            KeyEvent { code: KeyCode::Down, .. } | KeyEvent { code: KeyCode::Char('j'), .. } => {
+                self.help.scroll_down(1);
+                true
+            }
+            KeyEvent { code: KeyCode::PageUp, .. } => {
+                self.help.scroll_up(10);
+                true
+            }
+            KeyEvent { code: KeyCode::PageDown, .. } => {
+                self.help.scroll_down(10);
+                true
+            }
+            // Any other key closes help
+            _ => {
+                self.help.visible = false;
+                false
+            }
+        }
+    }
+
+    /// Key handling when the completion popup is active.
+    fn handle_key_completion(&mut self, key: KeyEvent) -> bool {
+        match key {
+            // Accept selection
+            KeyEvent { code: KeyCode::Enter, .. } => {
+                if let Some((start, end, text)) = self.completion.accept() {
+                    self.input.replace_range(start, end, &text);
+                }
+                true
+            }
+            // Next candidate
+            KeyEvent { code: KeyCode::Tab, modifiers, .. }
+                if !modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.completion.select_next();
+                true
+            }
+            KeyEvent { code: KeyCode::Down, .. } => {
+                self.completion.select_next();
+                true
+            }
+            // Previous candidate
+            KeyEvent { code: KeyCode::BackTab, .. }
+            | KeyEvent { code: KeyCode::Tab, modifiers: KeyModifiers::SHIFT, .. } => {
+                self.completion.select_prev();
+                true
+            }
+            KeyEvent { code: KeyCode::Up, .. } => {
+                self.completion.select_prev();
+                true
+            }
+            // Dismiss
+            KeyEvent { code: KeyCode::Esc, .. } => {
+                self.completion.dismiss();
+                true
+            }
+            // Any other key: dismiss completion and forward to normal handler
+            _ => {
+                self.completion.dismiss();
+                self.handle_key_normal(key)
+            }
+        }
+    }
+
+    /// Normal mode key handling.
+    fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
         match key {
             // Quit
             KeyEvent {
@@ -58,7 +161,28 @@ impl App {
             } => {
                 let text = self.input.submit();
                 if !text.trim().is_empty() {
+                    persistence::history::append_history(&text);
                     self.execute(&text);
+                }
+                true
+            }
+
+            // Tab completion
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers,
+                ..
+            } if !modifiers.contains(KeyModifiers::SHIFT) => {
+                self.completion.compute(
+                    &self.input.text,
+                    self.input.cursor,
+                    &self.evaluator.env,
+                );
+                // If exactly one match, insert directly
+                if self.completion.candidates.len() == 1 {
+                    if let Some((start, end, text)) = self.completion.accept() {
+                        self.input.replace_range(start, end, &text);
+                    }
                 }
                 true
             }
@@ -190,6 +314,29 @@ impl App {
                 true
             }
 
+            // Help panel toggle
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.help.toggle();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::F(1),
+                ..
+            } => {
+                self.help.toggle();
+                true
+            }
+
+            // Escape (no-op in normal mode, but consume the key)
+            KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            } => false,
+
             // Regular character input
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -206,6 +353,12 @@ impl App {
 
     /// Execute a line of input.
     fn execute(&mut self, input: &str) {
+        // Check for :commands
+        if let Some(cmd) = input.strip_prefix(':') {
+            self.execute_command(cmd.trim());
+            return;
+        }
+
         self.evaluator.output.clear();
 
         let result = Lexer::new(input)
@@ -243,6 +396,183 @@ impl App {
         self.worksheet.scroll_to_bottom(50);
     }
 
+    /// Execute a :command.
+    fn execute_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let name = parts[0];
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        match name {
+            "help" => {
+                self.help.toggle();
+            }
+            "clear" => {
+                self.worksheet = WorksheetState::new();
+            }
+            "save" => {
+                self.command_save(arg);
+            }
+            "load" => {
+                self.command_load(arg);
+            }
+            "sessions" => {
+                self.command_list_sessions();
+            }
+            _ => {
+                self.worksheet.add_entry(
+                    format!(":{}", cmd),
+                    OutputKind::Error(format!("unknown command: :{}", name)),
+                    vec![],
+                );
+            }
+        }
+        self.worksheet.scroll_to_bottom(50);
+    }
+
+    fn command_save(&mut self, arg: &str) {
+        use crate::persistence::session::*;
+
+        let name = if arg.is_empty() {
+            timestamp_name()
+        } else {
+            arg.to_string()
+        };
+
+        let mut entries = Vec::new();
+        for entry in &self.worksheet.entries {
+            let output = match &entry.output {
+                OutputKind::Value(v) => SavedOutput::Value(v.clone()),
+                OutputKind::Error(e) => SavedOutput::Error(e.clone()),
+                OutputKind::PrintOutput(lines) => SavedOutput::PrintOutput(lines.clone()),
+                OutputKind::Plot(p) => SavedOutput::Plot {
+                    label: p.spec.series.iter()
+                        .map(|s| s.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                },
+            };
+            entries.push(SavedEntry {
+                index: entry.index,
+                input: entry.input.clone(),
+                output,
+            });
+        }
+
+        let session = SavedSession {
+            name: name.clone(),
+            timestamp: timestamp_iso(),
+            entries,
+        };
+
+        match save_session(&session) {
+            Ok(()) => {
+                self.session_name = Some(name.clone());
+                self.worksheet.add_entry(
+                    format!(":save {}", name),
+                    OutputKind::Value(format!("Session saved: {}", name)),
+                    vec![],
+                );
+            }
+            Err(e) => {
+                self.worksheet.add_entry(
+                    format!(":save {}", name),
+                    OutputKind::Error(format!("Save failed: {}", e)),
+                    vec![],
+                );
+            }
+        }
+    }
+
+    fn command_load(&mut self, arg: &str) {
+        use crate::persistence::session::*;
+
+        if arg.is_empty() {
+            self.worksheet.add_entry(
+                ":load".to_string(),
+                OutputKind::Error("usage: :load <name>".to_string()),
+                vec![],
+            );
+            return;
+        }
+
+        match load_session(arg) {
+            Ok(session) => {
+                // Reset state
+                self.worksheet = WorksheetState::new();
+                self.evaluator = Evaluator::new();
+                // Re-init CAS from evaluator (preserve bridge paths)
+                // Just replay the inputs
+                let inputs: Vec<String> = session.entries.iter()
+                    .map(|e| e.input.clone())
+                    .collect();
+                // Deduplicate (same index may appear twice if there was PrintOutput)
+                let mut seen_inputs: Vec<String> = Vec::new();
+                for input in &inputs {
+                    if seen_inputs.last().map_or(true, |last| last != input) {
+                        seen_inputs.push(input.clone());
+                    }
+                }
+                for input in &seen_inputs {
+                    if !input.starts_with(':') {
+                        self.evaluator.output.clear();
+                        let result = Lexer::new(input)
+                            .tokenize()
+                            .and_then(|tokens| Parser::new(tokens).parse_program())
+                            .and_then(|stmts| self.evaluator.eval_program(&stmts));
+                        let print_lines = self.evaluator.output.clone();
+                        match result {
+                            Ok(Value::Plot(rendered)) => {
+                                self.worksheet.add_entry(input.clone(), OutputKind::Plot(rendered), print_lines);
+                            }
+                            Ok(value) => {
+                                self.worksheet.add_entry(input.clone(), OutputKind::Value(format!("{}", value)), print_lines);
+                            }
+                            Err(err) => {
+                                self.worksheet.add_entry(input.clone(), OutputKind::Error(err.message), print_lines);
+                            }
+                        }
+                    }
+                }
+                self.session_name = Some(arg.to_string());
+                self.worksheet.add_entry(
+                    format!(":load {}", arg),
+                    OutputKind::Value(format!("Session loaded: {} ({} entries)", arg, seen_inputs.len())),
+                    vec![],
+                );
+                self.worksheet.scroll_to_bottom(50);
+            }
+            Err(e) => {
+                self.worksheet.add_entry(
+                    format!(":load {}", arg),
+                    OutputKind::Error(format!("Load failed: {}", e)),
+                    vec![],
+                );
+            }
+        }
+    }
+
+    fn command_list_sessions(&mut self) {
+        use crate::persistence::session::list_sessions;
+
+        let sessions = list_sessions();
+        if sessions.is_empty() {
+            self.worksheet.add_entry(
+                ":sessions".to_string(),
+                OutputKind::Value("No saved sessions.".to_string()),
+                vec![],
+            );
+        } else {
+            let lines: Vec<String> = sessions.iter()
+                .map(|(name, ts)| format!("  {} ({})", name, ts))
+                .collect();
+            self.worksheet.add_entry(
+                ":sessions".to_string(),
+                OutputKind::Value(format!("Saved sessions:\n{}", lines.join("\n"))),
+                vec![],
+            );
+        }
+    }
+
     /// Render the full UI.
     pub fn render(&mut self, frame: &mut Frame) {
         let outer = Layout::vertical([
@@ -254,7 +584,7 @@ impl App {
 
         // Status bar
         let cas_status = self.evaluator.cas_status();
-        render_status_bar(frame, outer[0], &cas_status);
+        render_status_bar(frame, outer[0], &cas_status, self.session_name.as_deref());
 
         // Main area: worksheet + sidebar
         let main = Layout::horizontal([
@@ -266,6 +596,16 @@ impl App {
         self.render_worksheet(frame, main[0]);
         self.render_sidebar(frame, main[1]);
         self.render_input(frame, outer[2]);
+
+        // Render completion popup as overlay above input bar
+        if self.completion.active {
+            self.render_completion(frame, outer[2]);
+        }
+
+        // Render help panel as centered overlay
+        if self.help.visible {
+            self.render_help(frame, frame.area());
+        }
     }
 
     fn render_worksheet(&mut self, frame: &mut Frame, area: Rect) {
@@ -311,9 +651,10 @@ impl App {
         }
 
         // Calculate total height
+        let plot_rows = self.config.plot_height as usize;
         let total_height: usize = items.iter().map(|item| match item {
             RenderItem::TextLine(_) => 1,
-            RenderItem::PlotImage(_) => PLOT_ROWS as usize,
+            RenderItem::PlotImage(_) => plot_rows,
         }).sum();
 
         // Auto-scroll to bottom
@@ -329,7 +670,7 @@ impl App {
         for item in &items {
             let item_height = match item {
                 RenderItem::TextLine(_) => 1,
-                RenderItem::PlotImage(_) => PLOT_ROWS as usize,
+                RenderItem::PlotImage(_) => plot_rows,
             };
 
             // Skip items before the scroll offset
@@ -356,7 +697,7 @@ impl App {
                 }
                 RenderItem::PlotImage(entry_idx) => {
                     let remaining = (inner.y + inner.height).saturating_sub(inner.y + render_y);
-                    let plot_h = remaining.min(PLOT_ROWS);
+                    let plot_h = remaining.min(self.config.plot_height);
                     if plot_h > 0 {
                         let plot_area = Rect {
                             x: inner.x,
@@ -623,6 +964,134 @@ impl App {
             let paragraph = Paragraph::new(lines);
             frame.render_widget(paragraph, inner);
         }
+    }
+
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        use crate::tui::help::HELP_SECTIONS;
+
+        // 80% of screen, centered
+        let w = (area.width * 4 / 5).max(40);
+        let h = (area.height * 4 / 5).max(10);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup_area = Rect { x, y, width: w, height: h };
+
+        frame.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Theme::border_focused())
+            .title(Span::styled(
+                " Help \u{2014} Esc to close, \u{2191}/\u{2193} to scroll ",
+                Theme::sidebar_title(),
+            ));
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+
+        // Build all lines
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for &(title, content) in HELP_SECTIONS {
+            lines.push(Line::from(Span::styled(
+                format!(" {} ", title),
+                Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            for text_line in content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", text_line),
+                    Style::default(),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+
+        // Clamp scroll
+        let total = lines.len();
+        let visible = inner.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let scroll = self.help.scroll.min(max_scroll);
+
+        let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+        let paragraph = Paragraph::new(visible_lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    fn render_completion(&self, frame: &mut Frame, input_area: Rect) {
+        let max_vis = self.completion.max_visible();
+        let count = self.completion.candidates.len().min(max_vis);
+        if count == 0 {
+            return;
+        }
+
+        let popup_height = count as u16 + 2; // +2 for border
+        let prompt_len = "aurita> ".len() as u16;
+        let popup_x = input_area.x + 1 + prompt_len + self.completion.prefix_start as u16;
+        let popup_y = input_area.y.saturating_sub(popup_height);
+        let popup_width = 40u16.min(input_area.width.saturating_sub(popup_x.saturating_sub(input_area.x)));
+
+        let popup_area = Rect {
+            x: popup_x.min(input_area.x + input_area.width - popup_width),
+            y: popup_y,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the area behind the popup
+        frame.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+
+        let offset = self.completion.scroll_offset();
+        let items: Vec<ListItem> = self.completion.candidates
+            .iter()
+            .skip(offset)
+            .take(max_vis)
+            .enumerate()
+            .map(|(i, item)| {
+                let is_selected = i + offset == self.completion.selected;
+                let kind_label = item.kind.label();
+                let desc = if item.description.is_empty() {
+                    String::new()
+                } else {
+                    let avail = (inner.width as usize)
+                        .saturating_sub(item.text.len() + kind_label.len() + 4);
+                    if avail > 3 {
+                        let d = if item.description.len() > avail {
+                            format!("{}...", &item.description[..avail.saturating_sub(3)])
+                        } else {
+                            item.description.clone()
+                        };
+                        format!(" {}", d)
+                    } else {
+                        String::new()
+                    }
+                };
+
+                let style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                let kind_style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{} ", kind_label), kind_style),
+                    Span::styled(&item.text, style),
+                    Span::styled(desc, kind_style),
+                ]))
+            })
+            .collect();
+
+        let list = List::new(items);
+        frame.render_widget(list, inner);
     }
 
     fn render_input(&self, frame: &mut Frame, area: Rect) {

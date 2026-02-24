@@ -1,4 +1,5 @@
 pub mod app;
+pub mod completion;
 pub mod event;
 pub mod hints;
 pub mod input;
