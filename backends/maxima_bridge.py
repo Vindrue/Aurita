@@ -30,17 +30,19 @@ class MaximaProcess:
 
     def __init__(self):
         self.proc = subprocess.Popen(
-            ["maxima", "--very-quiet"],
+            ["maxima"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
+        # Read startup banner until first prompt
+        self._read_until_prompt()
         # Initialize: disable 2D display, set long line length
         self._send_raw("display2d:false$")
+        self._read_until_prompt()
         self._send_raw("linel:10000$")
-        # Read any startup output
         self._read_until_prompt()
 
     def _send_raw(self, cmd):
@@ -49,28 +51,47 @@ class MaximaProcess:
         self.proc.stdin.flush()
 
     def _read_until_prompt(self):
-        """Read Maxima output until we see an input prompt (%iN)."""
+        """Read Maxima output until we see an input prompt (%iN).
+
+        Reads character-by-character to handle prompts that appear on
+        the same line as output (no trailing newline).
+        """
+        buf = []
         output_lines = []
         while True:
-            line = self.proc.stdout.readline()
-            if not line:
+            ch = self.proc.stdout.read(1)
+            if not ch:
+                # EOF
                 break
-            line = line.rstrip("\n")
-            # Maxima prompts look like (%i2) or (%i10)
-            if re.match(r"^\(%i\d+\)\s*$", line):
-                break
-            output_lines.append(line)
-        return "\n".join(output_lines)
+            buf.append(ch)
+            if ch == '\n':
+                line = ''.join(buf).rstrip('\n')
+                buf = []
+                # Check if this line IS a prompt
+                if re.match(r'^\(%i\d+\)\s*$', line):
+                    break
+                # Strip output labels from content lines
+                output_lines.append(line)
+            else:
+                # Check if buffer so far matches a prompt (no newline at end)
+                current = ''.join(buf)
+                if re.match(r'^\(%i\d+\)\s*$', current.rstrip()):
+                    # Peek: is there more on this line? Wait briefly.
+                    # Actually, Maxima puts prompt at start of line and waits,
+                    # so if we see (%iN) followed by nothing, that's the prompt.
+                    # But we need to be careful — check if we have the full pattern.
+                    if re.match(r'^\(%i\d+\) $', current):
+                        break
+        return '\n'.join(output_lines)
 
     def execute(self, cmd):
         """Send a command to Maxima and return the output text."""
         self._send_raw(cmd)
         raw = self._read_until_prompt()
 
-        # Extract result: strip output label like (%o2)
+        # Extract result: strip output labels like (%o2)
         result_lines = []
         for line in raw.split("\n"):
-            # Remove output labels
             cleaned = re.sub(r"^\(%o\d+\)\s*", "", line)
             result_lines.append(cleaned)
 
