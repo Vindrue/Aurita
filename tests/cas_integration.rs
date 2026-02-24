@@ -118,10 +118,48 @@ fn test_sin_pi_evaluates_numerically() {
 
 #[test]
 fn test_gaussian_definite_integral() {
-    // int(e^(-a*x^2), x, -inf, inf) should give sqrt(pi/a)
+    // Gaussian integral: int(e^(-a*x^2), x, -inf, inf) = sqrt(pi/a)
+    // Note: must write "a*x^2" or "a x^2", NOT "ax^2" (ax is one identifier)
     let result = eval_str("int(e^(-a*x^2), x, -inf, inf)");
     assert!(result.contains("sqrt") && result.contains("pi"),
         "Expected sqrt(pi/a) or similar, got: {}", result);
+
+    // Space-separated implicit mul also works
+    let result2 = eval_str("int(e^(-a x^2), x, -inf, inf)");
+    assert!(result2.contains("sqrt") && result2.contains("pi"),
+        "Expected sqrt(pi/a) or similar, got: {}", result2);
+}
+
+#[test]
+fn test_definite_integral_trig() {
+    // int(sin(x)^2, x, 0, pi) = pi/2
+    let result = eval_str("int(sin(x)^2, x, 0, pi)");
+    assert!(result.contains("pi") || result.contains("1.5707"),
+        "Expected pi/2, got: {}", result);
+}
+
+#[test]
+fn test_definite_integral_polynomial() {
+    // int(x^3, x, 0, 2) = 4
+    let result = eval_str("int(x^3, x, 0, 2)");
+    assert!(result == "4" || result == "4.0",
+        "Expected 4, got: {}", result);
+}
+
+#[test]
+fn test_integral_with_inf_bounds() {
+    // int(e^(-x), x, 0, inf) = 1
+    let result = eval_str("int(e^(-x), x, 0, inf)");
+    assert!(result == "1" || result == "1.0",
+        "Expected 1, got: {}", result);
+}
+
+#[test]
+fn test_integral_inf_alias() {
+    // Inf (capital) should work the same as inf
+    let result = eval_str("int(e^(-x), x, 0, Inf)");
+    assert!(result == "1" || result == "1.0",
+        "Expected 1, got: {}", result);
 }
 
 #[test]
