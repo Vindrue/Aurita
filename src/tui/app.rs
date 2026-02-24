@@ -8,6 +8,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::StatefulImage;
 
 use crate::lang::builtins::{numeric_eval_sym, BUILTIN_CONSTANTS};
+use crate::physics::constants;
 use crate::lang::eval::Evaluator;
 use crate::lang::lexer::Lexer;
 use crate::lang::parser::Parser;
@@ -432,6 +433,7 @@ impl App {
 
         let sidebar = Layout::vertical([
             Constraint::Length(6),                          // Constants
+            Constraint::Length(10),                         // Physics
             Constraint::Min(3),                            // Variables
             Constraint::Min(3),                            // Functions
             Constraint::Length(hint_height),                // Hint (conditional)
@@ -439,10 +441,11 @@ impl App {
         .split(area);
 
         self.render_constants(frame, sidebar[0]);
-        self.render_variables(frame, sidebar[1]);
-        self.render_functions(frame, sidebar[2]);
+        self.render_physics(frame, sidebar[1]);
+        self.render_variables(frame, sidebar[2]);
+        self.render_functions(frame, sidebar[3]);
         if has_hint {
-            self.render_hint(frame, sidebar[3]);
+            self.render_hint(frame, sidebar[4]);
         }
     }
 
@@ -486,6 +489,51 @@ impl App {
         frame.render_widget(list, inner);
     }
 
+    fn render_physics(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Theme::border())
+            .title(Span::styled(" Physics ", Theme::sidebar_title()));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Show a curated set of the most commonly used physics constants
+        let show_names = ["c", "h", "hbar", "G", "k_B", "N_A", "e_charge", "m_e"];
+        let mut items: Vec<ListItem> = Vec::new();
+
+        for &name in &show_names {
+            if items.len() >= inner.height as usize {
+                break;
+            }
+            if let Some(pc) = constants::lookup(name) {
+                let val_str = if pc.uncertainty > 0.0 {
+                    format!("{:.3e} +/-", pc.value)
+                } else {
+                    format!("{:.4e}", pc.value)
+                };
+                let unit_part = if pc.unit_display.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", pc.unit_display)
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<8}", name),
+                        Style::default().fg(ratatui::style::Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{}{}", val_str, unit_part),
+                        Theme::sidebar_item(),
+                    ),
+                ])));
+            }
+        }
+
+        let list = List::new(items);
+        frame.render_widget(list, inner);
+    }
+
     fn render_variables(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -495,12 +543,14 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let physics_names = constants::all_names();
         let bindings = self.evaluator.env.borrow().all_bindings();
         let items: Vec<ListItem> = bindings
             .iter()
             .filter(|(name, v)| {
                 !matches!(v, Value::Function(_))
                     && !BUILTIN_CONSTANTS.contains(&name.as_str())
+                    && !physics_names.contains(&name.as_str())
             })
             .take(inner.height as usize)
             .map(|(name, value)| {

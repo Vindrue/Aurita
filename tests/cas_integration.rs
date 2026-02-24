@@ -471,3 +471,261 @@ fn test_cache_correctness() {
     assert_eq!(r1, r2, "Cached result should match: {} vs {}", r1, r2);
     assert_eq!(r1, "3*x^2");
 }
+
+// =============================================================================
+// Physics: measurements, units, and CODATA constants
+// =============================================================================
+
+/// Helper: evaluate without CAS (pure numeric + physics)
+fn eval_no_cas(input: &str) -> Result<Value, String> {
+    let mut evaluator = Evaluator::new();
+    let tokens = Lexer::new(input).tokenize().map_err(|e| e.message)?;
+    let stmts = Parser::new(tokens).parse_program().map_err(|e| e.message)?;
+    evaluator.eval_program(&stmts).map_err(|e| e.message)
+}
+
+fn eval_no_cas_str(input: &str) -> String {
+    format!("{}", eval_no_cas(input).unwrap())
+}
+
+fn eval_no_cas_multi(inputs: &[&str]) -> Result<Vec<Value>, String> {
+    let mut evaluator = Evaluator::new();
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = Lexer::new(input).tokenize().map_err(|e| e.message)?;
+        let stmts = Parser::new(tokens).parse_program().map_err(|e| e.message)?;
+        results.push(evaluator.eval_program(&stmts).map_err(|e| e.message)?);
+    }
+    Ok(results)
+}
+
+// --- Measurement creation ---
+
+#[test]
+fn test_measurement_plusminus() {
+    let result = eval_no_cas("9.81 +/- 0.02").unwrap();
+    let display = format!("{}", result);
+    assert!(display.contains("9.81"), "Expected 9.81 in {}", display);
+    assert!(display.contains("+/-"), "Expected +/- in {}", display);
+}
+
+#[test]
+fn test_measurement_pm_function() {
+    let result = eval_no_cas("pm(100, 5)").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 100.0);
+            assert_eq!(q.uncertainty, 5.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+// --- Unit annotation ---
+
+#[test]
+fn test_unit_meters() {
+    let result = eval_no_cas("5[m]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 5.0);
+            assert_eq!(q.uncertainty, 0.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+#[test]
+fn test_unit_km() {
+    let result = eval_no_cas("3[km]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 3000.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+#[test]
+fn test_unit_compound() {
+    let result = eval_no_cas("9.81[m/s^2]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert!((q.value - 9.81).abs() < 1e-10);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+#[test]
+fn test_measurement_with_units() {
+    let result = eval_no_cas("(10 +/- 1)[m]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 10.0);
+            assert_eq!(q.uncertainty, 1.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+// --- Unit arithmetic ---
+
+#[test]
+fn test_add_same_units() {
+    let result = eval_no_cas("3[m] + 2[m]").unwrap();
+    let display = format!("{}", result);
+    assert!(display.contains("5.0"), "Expected 5.0 in {}", display);
+    assert!(display.contains("[m]"), "Expected [m] in {}", display);
+}
+
+#[test]
+fn test_add_mismatched_units() {
+    let result = eval_no_cas("3[m] + 2[s]");
+    assert!(result.is_err(), "Expected error for mismatched units");
+}
+
+#[test]
+fn test_mul_units() {
+    let result = eval_no_cas("3[m] * 2[s]").unwrap();
+    let display = format!("{}", result);
+    assert!(display.contains("6.0"), "Expected 6.0 in {}", display);
+}
+
+#[test]
+fn test_div_units() {
+    let result = eval_no_cas("10[m] / 2[s]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 5.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+// --- Uncertainty propagation ---
+
+#[test]
+fn test_uncertainty_add() {
+    let result = eval_no_cas("(10 +/- 1)[m] + (20 +/- 2)[m]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 30.0);
+            let expected = (1.0_f64.powi(2) + 2.0_f64.powi(2)).sqrt();
+            assert!((q.uncertainty - expected).abs() < 1e-10);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+#[test]
+fn test_uncertainty_sin() {
+    let result = eval_no_cas("sin(1.0 +/- 0.01)").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert!((q.value - 1.0_f64.sin()).abs() < 1e-10);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+// --- CODATA constants ---
+
+#[test]
+fn test_codata_c() {
+    let result = eval_no_cas("c").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 299_792_458.0);
+            assert_eq!(q.uncertainty, 0.0);
+        }
+        _ => panic!("Expected Quantity for c, got: {}", result),
+    }
+}
+
+#[test]
+fn test_codata_G_has_uncertainty() {
+    let result = eval_no_cas("G").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert!(q.uncertainty > 0.0, "G should have nonzero uncertainty");
+        }
+        _ => panic!("Expected Quantity for G, got: {}", result),
+    }
+}
+
+#[test]
+fn test_c_times_second() {
+    let result = eval_no_cas("c * 1[s]").unwrap();
+    match result {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 299_792_458.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result),
+    }
+}
+
+// --- Physics builtins ---
+
+#[test]
+fn test_uncertainty_function() {
+    let result = eval_no_cas("uncertainty(G)").unwrap();
+    match result {
+        Value::Number(n) => {
+            assert!(n.as_f64() > 0.0);
+        }
+        _ => panic!("Expected Number, got: {}", result),
+    }
+}
+
+#[test]
+fn test_nominal_function() {
+    let result = eval_no_cas("nominal(c)").unwrap();
+    match result {
+        Value::Number(n) => {
+            assert_eq!(n.as_f64(), 299_792_458.0);
+        }
+        _ => panic!("Expected Number, got: {}", result),
+    }
+}
+
+#[test]
+fn test_units_function() {
+    let result = eval_no_cas("units(c)").unwrap();
+    match result {
+        Value::Str(s) => {
+            assert!(s.contains("m") && s.contains("s"), "Expected m/s in units, got: {}", s);
+        }
+        _ => panic!("Expected Str, got: {}", result),
+    }
+}
+
+// --- Unit conversion ---
+
+#[test]
+fn test_to_conversion_km_to_m() {
+    let result = eval_no_cas_multi(&["to(3[km], \"m\")"]).unwrap();
+    match &result[0] {
+        Value::Quantity(q) => {
+            assert_eq!(q.value, 3000.0);
+        }
+        _ => panic!("Expected Quantity, got: {}", result[0]),
+    }
+}
+
+#[test]
+fn test_to_conversion_dimension_mismatch() {
+    let result = eval_no_cas("to(3[m], \"s\")");
+    assert!(result.is_err(), "Expected error for dimension mismatch");
+}
+
+// --- No regression: vector indexing ---
+
+#[test]
+fn test_vector_indexing_no_regression() {
+    let results = eval_no_cas_multi(&[
+        "v = [10, 20, 30]",
+        "v[2]",
+    ]).unwrap();
+    assert_eq!(format!("{}", results[1]), "20");
+}

@@ -108,6 +108,13 @@ pub enum Expr {
         span: Span,
     },
 
+    /// Unit annotation: `3[m/s^2]`, `(10 +/- 1)[kg]`
+    UnitAnnotation {
+        expr: Box<Expr>,
+        unit_text: String,
+        span: Span,
+    },
+
     /// Lambda: `(x) -> x^2` (future)
     Lambda {
         params: Vec<String>,
@@ -129,6 +136,7 @@ impl Expr {
             Expr::Vector(_, s) => *s,
             Expr::Index { span, .. } => *span,
             Expr::Range { span, .. } => *span,
+            Expr::UnitAnnotation { span, .. } => *span,
             Expr::Lambda { span, .. } => *span,
         }
     }
@@ -156,6 +164,7 @@ pub enum BinOpKind {
     Geq,
     And,
     Or,
+    PlusMinus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -290,12 +290,177 @@ impl Evaluator {
                 }
             }
 
+            Expr::UnitAnnotation { expr, unit_text, span } => {
+                self.eval_unit_annotation(expr, unit_text, *span)
+            }
+
             Expr::Lambda { params, body, .. } => Ok(Value::Function(Function::UserDefined {
                 name: "<lambda>".to_string(),
                 params: params.clone(),
                 body: *body.clone(),
                 closure_env: self.env.clone(),
             })),
+        }
+    }
+
+    // --- Unit annotation evaluation ---
+
+    fn eval_unit_annotation(&mut self, expr: &Expr, unit_text: &str, span: Span) -> LangResult<Value> {
+        use crate::physics::units::parse_unit_expr;
+        use crate::lang::types::Quantity;
+
+        let (multiplier, unit) = parse_unit_expr(unit_text)
+            .map_err(|e| LangError::eval(format!("unit: {}", e)).with_span(span))?;
+
+        let inner = self.eval_expr(expr)?;
+
+        match &inner {
+            Value::Number(n) => {
+                let v = n.as_f64();
+                Ok(Value::Quantity(Quantity::exact(v * multiplier, unit)))
+            }
+            Value::Quantity(q) => {
+                if q.unit.is_dimensionless() {
+                    // Dimensionless quantity (from +/-) — apply units
+                    Ok(Value::Quantity(Quantity::new(
+                        q.value * multiplier,
+                        q.uncertainty * multiplier,
+                        unit,
+                    )))
+                } else {
+                    Err(LangError::type_err(
+                        "cannot annotate units on a value that already has units"
+                    ).with_span(span))
+                }
+            }
+            _ => Err(LangError::type_err(format!(
+                "cannot annotate units on {}", inner.type_name()
+            )).with_span(span)),
+        }
+    }
+
+    // --- PlusMinus and Quantity arithmetic ---
+
+    fn eval_plus_minus(&self, left: &Value, right: &Value, span: Span) -> LangResult<Value> {
+        // lhs = value (Number or Quantity), rhs = uncertainty (Number)
+        let rhs_f = right.as_f64().ok_or_else(|| {
+            LangError::type_err("uncertainty (right side of +/-) must be a number").with_span(span)
+        })?;
+
+        match left {
+            Value::Number(n) => Ok(Value::Quantity(Quantity::dimensionless(n.as_f64(), rhs_f))),
+            Value::Quantity(q) => {
+                // Add uncertainty to existing quantity
+                let new_unc = (q.uncertainty * q.uncertainty + rhs_f * rhs_f).sqrt();
+                Ok(Value::Quantity(Quantity::new(q.value, new_unc, q.unit)))
+            }
+            _ => Err(LangError::type_err(format!(
+                "cannot apply +/- to {}", left.type_name()
+            )).with_span(span)),
+        }
+    }
+
+    fn eval_quantity_binop(
+        &self,
+        op: BinOpKind,
+        left: &Value,
+        right: &Value,
+        span: Span,
+    ) -> LangResult<Value> {
+        use crate::physics::error_prop::*;
+
+        // Promote Number to exact dimensionless Quantity
+        let lq = self.to_quantity(left, span)?;
+        let rq = self.to_quantity(right, span)?;
+
+        let result = match op {
+            BinOpKind::Add => {
+                if lq.unit != rq.unit {
+                    return Err(LangError::type_err(format!(
+                        "unit mismatch in addition: [{}] vs [{}]", lq.unit, rq.unit
+                    )).with_span(span));
+                }
+                prop_add(lq.value, lq.uncertainty, rq.value, rq.uncertainty, lq.unit)
+            }
+            BinOpKind::Sub => {
+                if lq.unit != rq.unit {
+                    return Err(LangError::type_err(format!(
+                        "unit mismatch in subtraction: [{}] vs [{}]", lq.unit, rq.unit
+                    )).with_span(span));
+                }
+                prop_sub(lq.value, lq.uncertainty, rq.value, rq.uncertainty, lq.unit)
+            }
+            BinOpKind::Mul => {
+                prop_mul(lq.value, lq.uncertainty, lq.unit, rq.value, rq.uncertainty, rq.unit)
+            }
+            BinOpKind::Div => {
+                if rq.value == 0.0 {
+                    return Err(LangError::new(
+                        crate::lang::error::ErrorKind::DivisionByZero, "division by zero"
+                    ).with_span(span));
+                }
+                prop_div(lq.value, lq.uncertainty, lq.unit, rq.value, rq.uncertainty, rq.unit)
+            }
+            BinOpKind::Pow => {
+                // Exponent must be dimensionless and exact
+                if !rq.unit.is_dimensionless() {
+                    return Err(LangError::type_err(
+                        "exponent must be dimensionless"
+                    ).with_span(span));
+                }
+                let n = rq.value;
+                if n.fract() == 0.0 && n.abs() < 127.0 {
+                    prop_pow_int(lq.value, lq.uncertainty, lq.unit, n as i8)
+                } else {
+                    if !lq.unit.is_dimensionless() {
+                        return Err(LangError::type_err(
+                            "non-integer exponent requires dimensionless base"
+                        ).with_span(span));
+                    }
+                    prop_pow_float(lq.value, lq.uncertainty, n)
+                }
+            }
+            BinOpKind::Eq => {
+                return Ok(Value::Bool(lq.value == rq.value && lq.unit == rq.unit));
+            }
+            BinOpKind::Neq => {
+                return Ok(Value::Bool(lq.value != rq.value || lq.unit != rq.unit));
+            }
+            BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Leq | BinOpKind::Geq => {
+                if lq.unit != rq.unit {
+                    return Err(LangError::type_err(format!(
+                        "unit mismatch in comparison: [{}] vs [{}]", lq.unit, rq.unit
+                    )).with_span(span));
+                }
+                let result = match op {
+                    BinOpKind::Lt => lq.value < rq.value,
+                    BinOpKind::Gt => lq.value > rq.value,
+                    BinOpKind::Leq => lq.value <= rq.value,
+                    BinOpKind::Geq => lq.value >= rq.value,
+                    _ => unreachable!(),
+                };
+                return Ok(Value::Bool(result));
+            }
+            _ => {
+                return Err(LangError::type_err(format!(
+                    "cannot apply {:?} to quantities", op
+                )).with_span(span));
+            }
+        };
+
+        Ok(Value::Quantity(Quantity::new(result.value, result.uncertainty, result.unit)))
+    }
+
+    /// Promote a Value to a Quantity for arithmetic.
+    fn to_quantity(&self, val: &Value, span: Span) -> LangResult<Quantity> {
+        use crate::physics::units::UnitExpr;
+
+        match val {
+            Value::Quantity(q) => Ok(q.clone()),
+            Value::Number(n) => Ok(Quantity::exact(n.as_f64(), UnitExpr::dimensionless())),
+            _ => Err(LangError::type_err(format!(
+                "cannot use {} in quantity arithmetic", val.type_name()
+            )).with_span(span)),
         }
     }
 
@@ -308,6 +473,16 @@ impl Evaluator {
         right: &Value,
         span: Span,
     ) -> LangResult<Value> {
+        // PlusMinus operator: value +/- uncertainty → Quantity
+        if op == BinOpKind::PlusMinus {
+            return self.eval_plus_minus(left, right, span);
+        }
+
+        // Quantity arithmetic: if either side is a Quantity, dispatch to quantity ops
+        if matches!(left, Value::Quantity(_)) || matches!(right, Value::Quantity(_)) {
+            return self.eval_quantity_binop(op, left, right, span);
+        }
+
         // If either side is symbolic, promote to symbolic
         if left.is_symbolic() || right.is_symbolic() {
             if let Some(sym_op) = binop_to_symop(op) {
@@ -496,6 +671,9 @@ impl Evaluator {
                 Value::Number(Number::Int(n)) => Ok(Value::Number(Number::Int(-n))),
                 Value::Number(Number::Float(f)) => Ok(Value::Number(Number::Float(-f))),
                 Value::Symbolic(expr) => Ok(Value::Symbolic(SymExpr::neg(expr.clone()))),
+                Value::Quantity(q) => {
+                    Ok(Value::Quantity(Quantity::new(-q.value, q.uncertainty, q.unit)))
+                }
                 Value::Vector(v) => {
                     let negated: LangResult<Vec<Value>> = v
                         .iter()
@@ -538,6 +716,7 @@ impl Evaluator {
             "plot" => Ok(Some(self.eval_plot(args, span)?)),
             "backend" => Ok(Some(self.set_backend(args, span)?)),
             "using" => Ok(Some(self.eval_using(args, span)?)),
+            "to" => Ok(Some(self.eval_unit_convert(args, span)?)),
             _ => Ok(None),
         }
     }
@@ -642,6 +821,42 @@ impl Evaluator {
         manager.routing = saved_routing;
 
         result
+    }
+
+    /// Unit conversion: to(quantity, "unit") → Quantity
+    fn eval_unit_convert(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        use crate::physics::units::parse_unit_expr;
+
+        if args.len() != 2 {
+            return Err(LangError::arity("to: expected 2 arguments: to(quantity, \"unit\")").with_span(span));
+        }
+
+        let val = self.eval_expr(&args[0])?;
+        let q = self.to_quantity(&val, span)?;
+
+        // Get target unit string
+        let target_str = match self.eval_expr(&args[1])? {
+            Value::Str(s) => s,
+            Value::Symbolic(SymExpr::Sym { name }) => name,
+            _ => return Err(LangError::type_err("to: second argument must be a unit string").with_span(span)),
+        };
+
+        let (target_mult, target_dims) = parse_unit_expr(&target_str)
+            .map_err(|e| LangError::eval(format!("to: {}", e)).with_span(span))?;
+
+        // Check dimensional compatibility
+        if q.unit != target_dims {
+            return Err(LangError::type_err(format!(
+                "to: cannot convert [{}] to [{}] — different dimensions", q.unit, target_dims
+            )).with_span(span));
+        }
+
+        // Convert: value is already in SI, divide by target multiplier
+        Ok(Value::Quantity(Quantity::new(
+            q.value / target_mult,
+            q.uncertainty / target_mult,
+            target_dims,
+        )))
     }
 
     fn cas_differentiate(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -1142,11 +1357,12 @@ impl Evaluator {
         Ok(points)
     }
 
-    /// Convert a Value to f64, handling Number, Symbolic constants, and evaluable symbolic exprs.
+    /// Convert a Value to f64, handling Number, Symbolic constants, Quantity, and evaluable symbolic exprs.
     fn value_to_f64(&self, val: &Value) -> Option<f64> {
         match val {
             Value::Number(n) => Some(n.as_f64()),
             Value::Symbolic(expr) => numeric_eval_sym(expr),
+            Value::Quantity(q) => Some(q.value),
             _ => None,
         }
     }
@@ -1215,6 +1431,34 @@ impl Evaluator {
                         args.len()
                     ))
                     .with_span(span));
+                }
+
+                // If the single argument is a Quantity and this is a math function,
+                // propagate uncertainty or convert to numeric
+                if args.len() == 1 {
+                    if let Value::Quantity(q) = &args[0] {
+                        // Only do uncertainty propagation / numeric conversion for math functions
+                        let is_math_func = crate::physics::error_prop::prop_func(name, 0.0, 0.0).is_ok();
+                        if is_math_func {
+                            if q.uncertainty > 0.0 {
+                                if !q.unit.is_dimensionless() {
+                                    return Err(LangError::type_err(format!(
+                                        "{}: argument must be dimensionless for uncertainty propagation", name
+                                    )).with_span(span));
+                                }
+                                match crate::physics::error_prop::prop_func(name, q.value, q.uncertainty) {
+                                    Ok(r) => return Ok(Value::Quantity(Quantity::new(r.value, r.uncertainty, r.unit))),
+                                    Err(_) => {}
+                                }
+                            } else {
+                                // Exact quantity, call math function with the numeric value
+                                let num_args = vec![Value::Number(Number::Float(q.value))];
+                                let result = (func.0)(&num_args).map_err(|e| LangError::eval(e).with_span(span))?;
+                                return Ok(result);
+                            }
+                        }
+                        // Non-math functions (typeof, uncertainty, etc.) get the Quantity directly
+                    }
                 }
 
                 // If any argument is symbolic, try numeric eval first (for constants),
@@ -1701,5 +1945,350 @@ mod tests {
         let display = format!("{}", v);
         assert!(display.contains("plot:"));
         assert!(display.contains("sin(x)"));
+    }
+
+    // === Physics / Quantity tests ===
+
+    #[test]
+    fn test_plus_minus_basic() {
+        let v = eval("9.81 +/- 0.02");
+        assert!(matches!(v, Value::Quantity(_)));
+        let display = format!("{}", v);
+        assert!(display.contains("9.81"));
+        assert!(display.contains("+/-"));
+        assert!(display.contains("0.02"));
+    }
+
+    #[test]
+    fn test_plus_minus_integer() {
+        let v = eval("100 +/- 5");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 100.0);
+            assert_eq!(q.uncertainty, 5.0);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_unit_annotation_simple() {
+        let v = eval("3[m]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 3.0);
+            assert_eq!(q.uncertainty, 0.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_unit_annotation_prefixed() {
+        let v = eval("3[km]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 3000.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_unit_annotation_compound() {
+        let v = eval("9.81[m/s^2]");
+        if let Value::Quantity(q) = &v {
+            assert!((q.value - 9.81).abs() < 1e-10);
+            assert_eq!(q.unit.m, 1);
+            assert_eq!(q.unit.s, -2);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_measurement_with_units() {
+        let v = eval("(10 +/- 1)[m]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 10.0);
+            assert_eq!(q.uncertainty, 1.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantity_add_same_units() {
+        let v = eval("3[m] + 2[m]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 5.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantity_add_mismatch_error() {
+        let tokens = Lexer::new("3[m] + 2[s]").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("unit mismatch"));
+    }
+
+    #[test]
+    fn test_quantity_mul() {
+        let v = eval("3[m] * 2[s]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 6.0);
+            assert_eq!(q.unit.m, 1);
+            assert_eq!(q.unit.s, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantity_div() {
+        let v = eval("10[m] / 2[s]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 5.0);
+            assert_eq!(q.unit.m, 1);
+            assert_eq!(q.unit.s, -1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantity_pow() {
+        let v = eval("3[m] ^ 2");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 9.0);
+            assert_eq!(q.unit.m, 2);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_uncertainty_propagation_add() {
+        let v = eval("(10 +/- 1)[m] + (20 +/- 2)[m]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 30.0);
+            let expected_unc = (1.0_f64.powi(2) + 2.0_f64.powi(2)).sqrt();
+            assert!((q.uncertainty - expected_unc).abs() < 1e-10);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_uncertainty_propagation_mul() {
+        let v = eval("(10 +/- 1) * (20 +/- 2)");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 200.0);
+            // rel unc: sqrt((1/10)^2 + (2/20)^2) = sqrt(0.02)
+            let expected_unc = 200.0 * (0.01_f64 + 0.01).sqrt();
+            assert!((q.uncertainty - expected_unc).abs() < 1e-6);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_sin_uncertainty_propagation() {
+        let v = eval("sin(1.0 +/- 0.01)");
+        if let Value::Quantity(q) = &v {
+            assert!((q.value - 1.0_f64.sin()).abs() < 1e-10);
+            // d/dx sin(x) = cos(x), so unc = |cos(1)| * 0.01
+            let expected_unc = 1.0_f64.cos().abs() * 0.01;
+            assert!((q.uncertainty - expected_unc).abs() < 1e-10);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_codata_c() {
+        let v = eval("c");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 299_792_458.0);
+            assert_eq!(q.uncertainty, 0.0);
+            assert_eq!(q.unit.m, 1);
+            assert_eq!(q.unit.s, -1);
+        } else {
+            panic!("expected Quantity for c, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_codata_G() {
+        let v = eval("G");
+        if let Value::Quantity(q) = &v {
+            assert!(q.uncertainty > 0.0);
+            assert_eq!(q.unit.m, 3);
+            assert_eq!(q.unit.kg, -1);
+            assert_eq!(q.unit.s, -2);
+        } else {
+            panic!("expected Quantity for G, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_c_times_time() {
+        let v = eval("c * 1[s]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 299_792_458.0);
+            // m/s * s = m
+            assert_eq!(q.unit.m, 1);
+            assert_eq!(q.unit.s, 0);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_uncertainty_builtin() {
+        let v = eval("uncertainty(G)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!(f > 0.0);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_nominal_builtin() {
+        let v = eval("nominal(c)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert_eq!(f, 299_792_458.0);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_units_builtin() {
+        let v = eval("units(c)");
+        if let Value::Str(s) = v {
+            assert!(s.contains("m"));
+            assert!(s.contains("s"));
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pm_function() {
+        let v = eval("pm(100, 5)");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 100.0);
+            assert_eq!(q.uncertainty, 5.0);
+            assert!(q.unit.is_dimensionless());
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_to_conversion() {
+        let mut e = Evaluator::new();
+        let v = eval_with(&mut e, "to(3[km], \"m\")");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 3000.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_to_conversion_mismatch() {
+        let tokens = Lexer::new("to(3[m], \"s\")").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_indexing_still_works() {
+        // v[2] should still be vector indexing, not unit annotation
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "v = [10, 20, 30]");
+        assert_eq!(eval_with(&mut e, "v[2]"), Value::Number(Number::Int(20)));
+    }
+
+    #[test]
+    fn test_negate_quantity() {
+        let v = eval("-(5[m])");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, -5.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantity_display_uncertain_with_units() {
+        let v = eval("(9.81 +/- 0.02)[m/s^2]");
+        let display = format!("{}", v);
+        assert!(display.contains("9.81"));
+        assert!(display.contains("+/-"));
+        assert!(display.contains("m"));
+    }
+
+    #[test]
+    fn test_quantity_display_exact_with_units() {
+        let v = eval("299792458[m/s]");
+        let display = format!("{}", v);
+        assert!(display.contains("299792458"));
+        assert!(display.contains("[m/s]"));
+        assert!(!display.contains("+/-"));
+    }
+
+    #[test]
+    fn test_quantity_scalar_mul() {
+        // Number * Quantity
+        let v = eval("2 * 5[m]");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 10.0);
+            assert_eq!(q.unit.m, 1);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_typeof_quantity() {
+        let v = eval("typeof(3[m])");
+        assert_eq!(v, Value::Str("quantity".to_string()));
+    }
+
+    #[test]
+    fn test_unicode_plusminus() {
+        let v = eval("10 \u{00B1} 1");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 10.0);
+            assert_eq!(q.uncertainty, 1.0);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_plusminus_precedence() {
+        // 3 + 1 +/- 0.1 should be (3+1) +/- 0.1 = 4 +/- 0.1
+        let v = eval("3 + 1 +/- 0.1");
+        if let Value::Quantity(q) = &v {
+            assert_eq!(q.value, 4.0);
+            assert!((q.uncertainty - 0.1).abs() < 1e-10);
+        } else {
+            panic!("expected Quantity, got {:?}", v);
+        }
     }
 }

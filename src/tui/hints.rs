@@ -54,6 +54,12 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "print",    signature: "print(args...)",  description: "Print values" },
     FuncHint { name: "len",      signature: "len(v)",          description: "Length of vector or string" },
     FuncHint { name: "typeof",   signature: "typeof(x)",       description: "Type name of value" },
+    // Physics
+    FuncHint { name: "pm",          signature: "pm(value, uncertainty)",  description: "Create measurement with uncertainty" },
+    FuncHint { name: "uncertainty", signature: "uncertainty(x)",         description: "Extract uncertainty from quantity" },
+    FuncHint { name: "nominal",     signature: "nominal(x)",            description: "Extract nominal value from quantity" },
+    FuncHint { name: "units",       signature: "units(x)",              description: "Get unit string of quantity" },
+    FuncHint { name: "to",          signature: "to(quantity, \"unit\")", description: "Convert quantity to different unit" },
 ];
 
 /// Detect the innermost function call surrounding the cursor position.

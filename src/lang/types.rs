@@ -1,8 +1,65 @@
 use crate::lang::ast::Expr;
 use crate::lang::env::EnvRef;
+use crate::physics::units::UnitExpr;
 use crate::plot::types::RenderedPlot;
 use crate::symbolic::expr::SymExpr;
 use std::fmt;
+
+/// A numeric value with optional uncertainty and units.
+#[derive(Debug, Clone)]
+pub struct Quantity {
+    pub value: f64,
+    pub uncertainty: f64, // >= 0, 0.0 = exact
+    pub unit: UnitExpr,
+}
+
+impl Quantity {
+    pub fn new(value: f64, uncertainty: f64, unit: UnitExpr) -> Self {
+        Self { value, uncertainty: uncertainty.abs(), unit }
+    }
+
+    pub fn exact(value: f64, unit: UnitExpr) -> Self {
+        Self { value, uncertainty: 0.0, unit }
+    }
+
+    pub fn dimensionless(value: f64, uncertainty: f64) -> Self {
+        Self { value, uncertainty: uncertainty.abs(), unit: UnitExpr::dimensionless() }
+    }
+}
+
+impl fmt::Display for Quantity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Format the value
+        write!(f, "{}", format_number(self.value))?;
+
+        // Show uncertainty if nonzero
+        if self.uncertainty > 0.0 {
+            write!(f, " +/- {}", format_number(self.uncertainty))?;
+        }
+
+        // Show units if not dimensionless
+        if !self.unit.is_dimensionless() {
+            write!(f, " [{}]", self.unit)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Format a float nicely: avoid trailing zeros for whole numbers, use scientific for tiny/huge.
+fn format_number(v: f64) -> String {
+    if v == 0.0 {
+        return "0.0".to_string();
+    }
+    let abs = v.abs();
+    if abs >= 1e15 || (abs < 1e-3 && abs > 0.0) {
+        format!("{:e}", v)
+    } else if v.fract() == 0.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{}", v)
+    }
+}
 
 /// Runtime value produced by the evaluator.
 #[derive(Debug, Clone)]
@@ -21,6 +78,8 @@ pub enum Value {
     Function(Function),
     /// A rendered plot image.
     Plot(RenderedPlot),
+    /// Physical quantity with value, uncertainty, and units.
+    Quantity(Quantity),
     /// Unit value (result of statements with no return value).
     Unit,
 }
@@ -103,6 +162,7 @@ impl Value {
             Value::Vector(_) => "vector",
             Value::Function(_) => "function",
             Value::Plot(_) => "plot",
+            Value::Quantity(_) => "quantity",
             Value::Unit => "unit",
         }
     }
@@ -118,6 +178,7 @@ impl Value {
             Value::Unit => false,
             Value::Function(_) => true,
             Value::Plot(_) => true,
+            Value::Quantity(q) => q.value != 0.0,
         }
     }
 
@@ -148,6 +209,22 @@ impl Value {
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Number(Number::Int(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Extract as a (value, uncertainty) pair. Works for Number (0 uncertainty) and Quantity.
+    pub fn as_measurement(&self) -> Option<(f64, f64)> {
+        match self {
+            Value::Number(n) => Some((n.as_f64(), 0.0)),
+            Value::Quantity(q) => Some((q.value, q.uncertainty)),
+            _ => None,
+        }
+    }
+
+    pub fn as_quantity(&self) -> Option<&Quantity> {
+        match self {
+            Value::Quantity(q) => Some(q),
             _ => None,
         }
     }
@@ -187,6 +264,7 @@ impl fmt::Display for Value {
                 let labels: Vec<&str> = p.spec.series.iter().map(|s| s.label.as_str()).collect();
                 write!(f, "[plot: {}]", labels.join(", "))
             }
+            Value::Quantity(q) => write!(f, "{}", q),
             Value::Unit => write!(f, "()"),
         }
     }
@@ -199,6 +277,9 @@ impl PartialEq for Value {
             (Value::Symbolic(a), Value::Symbolic(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Quantity(a), Value::Quantity(b)) => {
+                a.value == b.value && a.uncertainty == b.uncertainty && a.unit == b.unit
+            }
             (Value::Unit, Value::Unit) => true,
             _ => false,
         }

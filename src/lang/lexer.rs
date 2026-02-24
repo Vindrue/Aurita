@@ -53,6 +53,10 @@ impl Lexer {
                 if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::new(TokenKind::PlusEq, Span::new(start, self.pos)))
+                } else if self.peek() == Some('/') && self.peek_at(1) == Some('-') {
+                    self.advance(); // consume '/'
+                    self.advance(); // consume '-'
+                    Ok(Token::new(TokenKind::PlusMinus, Span::new(start, self.pos)))
                 } else {
                     Ok(Token::new(TokenKind::Plus, Span::new(start, self.pos)))
                 }
@@ -168,6 +172,7 @@ impl Lexer {
             '\u{2265}' => Ok(Token::new(TokenKind::GtEq, Span::new(start, self.pos))),  // ≥
             '\u{2260}' => Ok(Token::new(TokenKind::BangEq, Span::new(start, self.pos))),// ≠
             '\u{22C5}' => Ok(Token::new(TokenKind::Star, Span::new(start, self.pos))),  // ⋅
+            '\u{00B1}' => Ok(Token::new(TokenKind::PlusMinus, Span::new(start, self.pos))), // ±
             _ => Err(
                 LangError::lex(format!("unexpected character: '{}'", ch))
                     .with_span(Span::new(start, self.pos)),

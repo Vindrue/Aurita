@@ -1,5 +1,6 @@
 use crate::lang::env::EnvRef;
 use crate::lang::types::*;
+use crate::physics::constants;
 use crate::symbolic::expr::{MathConst, SymExpr};
 use std::f64::consts;
 
@@ -94,6 +95,53 @@ pub fn register_builtins(env: &EnvRef) {
             func: BuiltinFn(builtin_numeric_eval),
         }),
     );
+
+    // Physics builtins
+    e.set(
+        "pm".to_string(),
+        Value::Function(Function::Builtin {
+            name: "pm".to_string(),
+            arity: Arity::Exact(2),
+            func: BuiltinFn(builtin_pm),
+        }),
+    );
+    e.set(
+        "uncertainty".to_string(),
+        Value::Function(Function::Builtin {
+            name: "uncertainty".to_string(),
+            arity: Arity::Exact(1),
+            func: BuiltinFn(builtin_uncertainty),
+        }),
+    );
+    e.set(
+        "nominal".to_string(),
+        Value::Function(Function::Builtin {
+            name: "nominal".to_string(),
+            arity: Arity::Exact(1),
+            func: BuiltinFn(builtin_nominal),
+        }),
+    );
+    e.set(
+        "units".to_string(),
+        Value::Function(Function::Builtin {
+            name: "units".to_string(),
+            arity: Arity::Exact(1),
+            func: BuiltinFn(builtin_units),
+        }),
+    );
+
+    // Register CODATA physical constants
+    register_physics_constants(&mut e);
+}
+
+/// Register all CODATA constants as Value::Quantity in the environment.
+fn register_physics_constants(e: &mut std::cell::RefMut<'_, crate::lang::env::Env>) {
+    for pc in constants::CODATA {
+        e.set(
+            pc.name.to_string(),
+            Value::Quantity(Quantity::new(pc.value, pc.uncertainty, pc.unit)),
+        );
+    }
 }
 
 // --- Math unary functions ---
@@ -271,6 +319,45 @@ fn builtin_len(args: &[Value]) -> Result<Value, String> {
 
 fn builtin_typeof(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Str(args[0].type_name().to_string()))
+}
+
+// --- Physics builtins ---
+
+fn builtin_pm(args: &[Value]) -> Result<Value, String> {
+    let value = args[0].as_f64()
+        .ok_or_else(|| "pm: first argument must be a number".to_string())?;
+    let unc = args[1].as_f64()
+        .ok_or_else(|| "pm: second argument must be a number".to_string())?;
+    Ok(Value::Quantity(Quantity::dimensionless(value, unc)))
+}
+
+fn builtin_uncertainty(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Quantity(q) => Ok(Value::Number(Number::Float(q.uncertainty))),
+        Value::Number(_) => Ok(Value::Number(Number::Float(0.0))),
+        _ => Err(format!("uncertainty: expected number or quantity, got {}", args[0].type_name())),
+    }
+}
+
+fn builtin_nominal(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Quantity(q) => Ok(Value::Number(Number::Float(q.value))),
+        Value::Number(n) => Ok(Value::Number(Number::Float(n.as_f64()))),
+        _ => Err(format!("nominal: expected number or quantity, got {}", args[0].type_name())),
+    }
+}
+
+fn builtin_units(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Quantity(q) => {
+            if q.unit.is_dimensionless() {
+                Ok(Value::Str("dimensionless".to_string()))
+            } else {
+                Ok(Value::Str(format!("{}", q.unit)))
+            }
+        }
+        _ => Ok(Value::Str("dimensionless".to_string())),
+    }
 }
 
 /// Evaluate a symbolic expression numerically.

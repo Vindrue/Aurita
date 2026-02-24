@@ -90,6 +90,9 @@ pub enum TokenKind {
     Or,
     Not,
 
+    // Physics
+    PlusMinus, // +/- or ±
+
     // Special
     Newline,
     Eof,

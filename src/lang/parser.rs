@@ -140,7 +140,7 @@ impl Parser {
         let mut lhs = self.parse_prefix()?;
 
         loop {
-            // Check for postfix: function call `(`, index `[`
+            // Check for postfix: function call `(`, index `[` or unit annotation `[`
             match self.peek_kind() {
                 TokenKind::LParen => {
                     if let Expr::Ident(_, _) = &lhs {
@@ -149,7 +149,11 @@ impl Parser {
                     }
                 }
                 TokenKind::LBracket => {
-                    lhs = self.parse_index(lhs)?;
+                    if self.should_parse_as_unit_annotation(&lhs) {
+                        lhs = self.parse_unit_annotation(lhs)?;
+                    } else {
+                        lhs = self.parse_index(lhs)?;
+                    }
                     continue;
                 }
                 _ => {}
@@ -165,6 +169,7 @@ impl Parser {
                 TokenKind::Gt => (BinOpKind::Gt, 7, 8),
                 TokenKind::LtEq => (BinOpKind::Leq, 7, 8),
                 TokenKind::GtEq => (BinOpKind::Geq, 7, 8),
+                TokenKind::PlusMinus => (BinOpKind::PlusMinus, 8, 9),
                 TokenKind::DotDot => {
                     // Range operator at very low precedence
                     if min_bp > 1 {
@@ -340,6 +345,68 @@ impl Parser {
         Ok(Expr::Index {
             object: Box::new(object),
             index: Box::new(index),
+            span: start.merge(end),
+        })
+    }
+
+    /// Decide whether `[` after `lhs` is a unit annotation or vector indexing.
+    ///
+    /// Unit annotation: Number, BinOp (arithmetic/PlusMinus), UnaryOp(Neg), grouped parens
+    /// Vector indexing: Ident, Call, Vector, Index
+    fn should_parse_as_unit_annotation(&self, lhs: &Expr) -> bool {
+        match lhs {
+            Expr::Number(_, _) => true,
+            Expr::BinOp { op, .. } => matches!(
+                op,
+                BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul
+                | BinOpKind::Div | BinOpKind::Pow | BinOpKind::Mod
+                | BinOpKind::PlusMinus
+            ),
+            Expr::UnaryOp { op: UnaryOpKind::Neg, .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Parse `[unit_text]` after an expression, consuming tokens until `]`.
+    fn parse_unit_annotation(&mut self, lhs: Expr) -> LangResult<Expr> {
+        let start = lhs.span();
+        self.expect(TokenKind::LBracket)?;
+
+        let mut unit_text = String::new();
+        loop {
+            match self.peek_kind() {
+                TokenKind::RBracket => break,
+                TokenKind::Eof => {
+                    return Err(LangError::parse("unterminated unit annotation, expected ']'")
+                        .with_span(start));
+                }
+                _ => {
+                    let tok = self.advance();
+                    // Reconstruct unit text from token kinds
+                    match &tok.kind {
+                        TokenKind::Ident(s) => unit_text.push_str(s),
+                        TokenKind::Star => unit_text.push('*'),
+                        TokenKind::Slash => unit_text.push('/'),
+                        TokenKind::Caret => unit_text.push('^'),
+                        TokenKind::Integer(n) => unit_text.push_str(&n.to_string()),
+                        TokenKind::Minus => unit_text.push('-'),
+                        TokenKind::LParen => unit_text.push('('),
+                        TokenKind::RParen => unit_text.push(')'),
+                        _ => {
+                            return Err(LangError::parse(format!(
+                                "unexpected token {:?} in unit annotation", tok.kind
+                            )).with_span(tok.span));
+                        }
+                    }
+                }
+            }
+        }
+
+        let end = self.expect(TokenKind::RBracket)?.span;
+
+        Ok(Expr::UnitAnnotation {
+            expr: Box::new(lhs),
+            unit_text,
             span: start.merge(end),
         })
     }
