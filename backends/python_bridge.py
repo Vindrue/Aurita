@@ -420,6 +420,14 @@ def handle_request(req):
             expr = expr_from_json(params["expr"])
             result = simplify(expr)
             result = postprocess(result)
+            # Try powsimp for better power/complex simplification, pick shorter
+            try:
+                alt = sympy.powsimp(expr)
+                alt = postprocess(alt)
+                if len(str(alt)) < len(str(result)):
+                    result = alt
+            except Exception:
+                pass
             return {"id": req_id, "status": "ok", "result": expr_to_json(result)}
 
         elif op_name == "expand":

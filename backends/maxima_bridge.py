@@ -371,6 +371,14 @@ def handle_request(maxima, req):
             mexpr = symexpr_to_maxima(params["expr"])
             cmd = f"ratsimp({mexpr});"
             result = maxima.execute(cmd)
+            # Also try rectform for complex expression simplification
+            try:
+                cmd2 = f"rectform(ratsimp({mexpr}));"
+                alt = maxima.execute(cmd2)
+                if len(alt) < len(result):
+                    result = alt
+            except Exception:
+                pass
             return {"id": req_id, "status": "ok", "result": maxima_to_symexpr(result)}
 
         elif op_name == "expand":

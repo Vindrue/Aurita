@@ -807,6 +807,8 @@ impl App {
                     Value::Symbolic(expr) => {
                         if name == "inf" {
                             "\u{221e}".to_string()
+                        } else if name == "i" {
+                            "= \u{221a}(-1)".to_string()
                         } else if let Some(f) = numeric_eval_sym(expr) {
                             format!("\u{2248} {:.5}", f)
                         } else {

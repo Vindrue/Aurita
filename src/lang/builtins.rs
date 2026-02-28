@@ -5,7 +5,7 @@ use crate::symbolic::expr::{MathConst, SymExpr};
 use std::f64::consts;
 
 /// Names of built-in mathematical constants (used by sidebar to filter them out of user variables).
-pub const BUILTIN_CONSTANTS: &[&str] = &["pi", "e", "inf", "Inf", "tau"];
+pub const BUILTIN_CONSTANTS: &[&str] = &["pi", "e", "i", "inf", "Inf", "tau"];
 
 /// Register all built-in functions and constants into the environment.
 pub fn register_builtins(env: &EnvRef) {
@@ -78,6 +78,7 @@ pub fn register_builtins(env: &EnvRef) {
     // Math constants — stored as symbolic so they propagate through CAS
     e.set("pi".to_string(), Value::Symbolic(SymExpr::Const { name: MathConst::Pi }));
     e.set("e".to_string(), Value::Symbolic(SymExpr::Const { name: MathConst::E }));
+    e.set("i".to_string(), Value::Symbolic(SymExpr::Const { name: MathConst::I }));
     e.set("inf".to_string(), Value::Symbolic(SymExpr::Const { name: MathConst::Infinity }));
     e.set("Inf".to_string(), Value::Symbolic(SymExpr::Const { name: MathConst::Infinity }));
     e.set("tau".to_string(), Value::Symbolic(SymExpr::BinOp {
