@@ -235,22 +235,6 @@ fn collect_denom_factor<'a>(expr: &'a SymExpr, out: &mut MulAnalysis<'a>) {
     out.denom.push(DenomFactor { base: expr, exp: None });
 }
 
-/// Check if an expression is Neg(inner) and return the inner expression.
-fn as_negated(expr: &SymExpr) -> Option<&SymExpr> {
-    match expr {
-        SymExpr::Neg { expr: inner } => Some(inner),
-        // -1 * something in a Mul
-        SymExpr::BinOp { op: SymOp::Mul, lhs, rhs } => {
-            if matches!(lhs.as_ref(), SymExpr::Int { value: -1 }) {
-                Some(rhs)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Write a factor with parens if it's Add/Sub (lower precedence than Mul).
 fn write_mul_factor(f: &mut fmt::Formatter<'_>, expr: &SymExpr) -> fmt::Result {
     let needs_parens = matches!(
@@ -304,12 +288,11 @@ fn write_denom_factor(f: &mut fmt::Formatter<'_>, df: &DenomFactor<'_>) -> fmt::
     }
 }
 
-/// Format a Mul expression using fraction analysis.
-fn fmt_mul(expr: &SymExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let analysis = analyze_mul(expr);
-
-    // Handle sign
-    if analysis.negative {
+/// Format a Mul from its analysis. `show_sign` controls whether to write the `-` prefix;
+/// `analysis.negative` always controls whether negative-int factors display as absolute values
+/// (since analyze_mul already extracted the sign from them).
+fn fmt_mul_analysis(analysis: &MulAnalysis<'_>, show_sign: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if show_sign && analysis.negative {
         write!(f, "-")?;
     }
 
@@ -322,7 +305,7 @@ fn fmt_mul(expr: &SymExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 if i > 0 {
                     write!(f, "*")?;
                 }
-                // If we flipped sign on a negative int, display its absolute value
+                // If analyze_mul extracted sign from a negative int, display its absolute value
                 if analysis.negative && i == 0 {
                     if let SymExpr::Int { value } = factor {
                         if *value < 0 {
@@ -390,6 +373,54 @@ fn fmt_mul(expr: &SymExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     Ok(())
 }
 
+/// Format a Mul expression using fraction analysis.
+fn fmt_mul(expr: &SymExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let analysis = analyze_mul(expr);
+    fmt_mul_analysis(&analysis, true, f)
+}
+
+/// Check if an expression would display with a leading negative sign.
+fn is_effectively_negative(expr: &SymExpr) -> bool {
+    match expr {
+        SymExpr::Neg { .. } => true,
+        SymExpr::Int { value } => *value < 0,
+        SymExpr::Float { value } => *value < 0.0,
+        SymExpr::BinOp { op: SymOp::Mul, .. } => analyze_mul(expr).negative,
+        _ => false,
+    }
+}
+
+/// Format the absolute value of a negative expression (for use in subtraction display).
+fn fmt_abs(expr: &SymExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        SymExpr::Neg { expr: inner } => {
+            let needs_parens = matches!(
+                inner.as_ref(),
+                SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. }
+            );
+            if needs_parens {
+                write!(f, "({})", inner)
+            } else {
+                write!(f, "{}", inner)
+            }
+        }
+        SymExpr::Int { value } => write!(f, "{}", value.abs()),
+        SymExpr::Float { value } => {
+            let v = value.abs();
+            if v.fract() == 0.0 && v < 1e15 {
+                write!(f, "{:.1}", v)
+            } else {
+                write!(f, "{}", v)
+            }
+        }
+        SymExpr::BinOp { op: SymOp::Mul, .. } => {
+            let analysis = analyze_mul(expr);
+            fmt_mul_analysis(&analysis, false, f)
+        }
+        _ => write!(f, "{}", expr),
+    }
+}
+
 impl fmt::Display for SymExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -436,27 +467,13 @@ impl fmt::Display for SymExpr {
                 }
                 Ok(())
             }
-            // Add: check if rhs is negated for sign handling
+            // Add: check if rhs is effectively negative for sign handling
             SymExpr::BinOp { op: SymOp::Add, lhs, rhs } => {
-                let lhs_needs_parens = false; // Add is lowest precedence
-                if lhs_needs_parens {
-                    write!(f, "({})", lhs)?;
-                } else {
-                    write!(f, "{}", lhs)?;
-                }
+                write!(f, "{}", lhs)?;
 
-                if let Some(inner) = as_negated(rhs) {
-                    // rhs is negative: display as " - inner"
+                if is_effectively_negative(rhs) {
                     write!(f, " - ")?;
-                    let inner_needs_parens = matches!(
-                        inner,
-                        SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. }
-                    );
-                    if inner_needs_parens {
-                        write!(f, "({})", inner)
-                    } else {
-                        write!(f, "{}", inner)
-                    }
+                    fmt_abs(rhs, f)
                 } else {
                     write!(f, " + ")?;
                     write!(f, "{}", rhs)
@@ -686,5 +703,29 @@ mod tests {
     fn test_imaginary_const() {
         let expr = SymExpr::Const { name: MathConst::I };
         assert_eq!(format!("{}", expr), "i");
+    }
+
+    #[test]
+    fn test_add_neg_coeff_mul() {
+        // a + Mul(Int(-2), f, i, m) → "a - 2*f*i*m"
+        // This is what CAS returns for negative-coefficient terms
+        let expr = SymExpr::add(
+            SymExpr::sym("a"),
+            SymExpr::mul(
+                SymExpr::mul(
+                    SymExpr::mul(SymExpr::int(-2), SymExpr::sym("f")),
+                    SymExpr::Const { name: MathConst::I },
+                ),
+                SymExpr::sym("m"),
+            ),
+        );
+        assert_eq!(format!("{}", expr), "a - 2*f*i*m");
+    }
+
+    #[test]
+    fn test_add_neg_int() {
+        // a + Int(-3) → "a - 3"
+        let expr = SymExpr::add(SymExpr::sym("a"), SymExpr::int(-3));
+        assert_eq!(format!("{}", expr), "a - 3");
     }
 }
