@@ -2,6 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::{
+    event::{EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -29,7 +30,7 @@ fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     if let Err(err) = result {
@@ -96,6 +97,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option
             match event {
                 AppEvent::Key(key) => {
                     app.handle_key(key);
+                }
+                AppEvent::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
                 }
                 AppEvent::Resize(_, _) => {
                     // Terminal will auto-redraw

@@ -551,6 +551,257 @@ impl fmt::Display for SymExpr {
     }
 }
 
+/// Convert an integer to Unicode superscript characters.
+fn to_superscript(n: i64) -> String {
+    const SUPERSCRIPTS: &[char] = &['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    let s = n.abs().to_string();
+    let mut result = String::new();
+    if n < 0 {
+        result.push('⁻');
+    }
+    for ch in s.chars() {
+        let digit = ch as usize - '0' as usize;
+        result.push(SUPERSCRIPTS[digit]);
+    }
+    result
+}
+
+/// Pretty-mode constants display.
+fn pretty_const(name: &MathConst) -> &'static str {
+    match name {
+        MathConst::Pi => "π",
+        MathConst::E => "e",
+        MathConst::I => "i",
+        MathConst::Infinity => "∞",
+        MathConst::NegInfinity => "-∞",
+    }
+}
+
+impl SymExpr {
+    /// Format with the given output mode.
+    pub fn format_pretty(&self) -> String {
+        match self {
+            SymExpr::Sym { name } => name.clone(),
+            SymExpr::Int { value } => format!("{}", value),
+            SymExpr::Rational { num, den } => format!("{}/{}", num, den),
+            SymExpr::Float { value } => {
+                if value.fract() == 0.0 && value.abs() < 1e15 {
+                    format!("{:.1}", value)
+                } else {
+                    format!("{}", value)
+                }
+            }
+            SymExpr::Const { name } => pretty_const(name).to_string(),
+            SymExpr::BinOp { op: SymOp::Pow, lhs, rhs } => {
+                // Pretty mode: use superscript for integer exponents
+                if let Some(n) = rhs.as_int() {
+                    let base = lhs.format_pretty();
+                    let needs_parens = matches!(
+                        lhs.as_ref(),
+                        SymExpr::BinOp { .. } | SymExpr::Neg { .. }
+                    );
+                    if needs_parens {
+                        format!("({}){}", base, to_superscript(n))
+                    } else {
+                        format!("{}{}", base, to_superscript(n))
+                    }
+                } else {
+                    // Non-integer exponent: fall back to ^ notation
+                    let base = lhs.format_pretty();
+                    let exp = rhs.format_pretty();
+                    let needs_lhs_parens = matches!(
+                        lhs.as_ref(),
+                        SymExpr::BinOp { .. } | SymExpr::Neg { .. }
+                    );
+                    let needs_rhs_parens = matches!(
+                        rhs.as_ref(),
+                        SymExpr::BinOp { op: SymOp::Add | SymOp::Sub | SymOp::Mul | SymOp::Div, .. }
+                        | SymExpr::Neg { .. }
+                    );
+                    format!("{}^{}",
+                        if needs_lhs_parens { format!("({})", base) } else { base },
+                        if needs_rhs_parens { format!("({})", exp) } else { exp },
+                    )
+                }
+            }
+            SymExpr::BinOp { op: SymOp::Mul, .. } => self.format_pretty_mul(),
+            SymExpr::BinOp { op: SymOp::Div, lhs, rhs } => {
+                let l = lhs.format_pretty();
+                let r = rhs.format_pretty();
+                let lp = matches!(lhs.as_ref(), SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. });
+                let rp = matches!(rhs.as_ref(), SymExpr::BinOp { .. } | SymExpr::Neg { .. });
+                format!("{}/{}",
+                    if lp { format!("({})", l) } else { l },
+                    if rp { format!("({})", r) } else { r },
+                )
+            }
+            SymExpr::BinOp { op: SymOp::Add, lhs, rhs } => {
+                let l = lhs.format_pretty();
+                if is_effectively_negative(rhs) {
+                    format!("{} - {}", l, self.format_pretty_abs(rhs))
+                } else {
+                    format!("{} + {}", l, rhs.format_pretty())
+                }
+            }
+            SymExpr::BinOp { op: SymOp::Sub, lhs, rhs } => {
+                let l = lhs.format_pretty();
+                let r = rhs.format_pretty();
+                let rp = matches!(rhs.as_ref(), SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. });
+                format!("{} - {}", l, if rp { format!("({})", r) } else { r })
+            }
+            SymExpr::Neg { expr } => {
+                let inner = expr.format_pretty();
+                let needs_parens = matches!(
+                    expr.as_ref(),
+                    SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. }
+                );
+                if needs_parens { format!("-({})", inner) } else { format!("-{}", inner) }
+            }
+            SymExpr::Func { name, args } => {
+                let arg_strs: Vec<String> = args.iter().map(|a| a.format_pretty()).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
+            SymExpr::Vector { elements } => {
+                let el_strs: Vec<String> = elements.iter().map(|e| e.format_pretty()).collect();
+                format!("[{}]", el_strs.join(", "))
+            }
+            SymExpr::Undefined => "undefined".to_string(),
+        }
+    }
+
+    /// Extract integer value if this is an Int node.
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            SymExpr::Int { value } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Pretty-format a Mul chain using fraction analysis.
+    fn format_pretty_mul(&self) -> String {
+        let analysis = analyze_mul(self);
+        let mut result = String::new();
+        if analysis.negative {
+            result.push('-');
+        }
+
+        let numer_str = if analysis.numer.is_empty() {
+            "1".to_string()
+        } else {
+            let mut parts = Vec::new();
+            for (i, factor) in analysis.numer.iter().enumerate() {
+                let s = if analysis.negative && i == 0 {
+                    if let SymExpr::Int { value } = factor {
+                        if *value < 0 { format!("{}", -value) } else { factor.format_pretty() }
+                    } else { factor.format_pretty() }
+                } else { factor.format_pretty() };
+                let needs_parens = matches!(factor, SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. } | SymExpr::Neg { .. });
+                if needs_parens { parts.push(format!("({})", s)); } else { parts.push(s); }
+            }
+            parts.join("*")
+        };
+
+        if analysis.denom.is_empty() {
+            result.push_str(&numer_str);
+        } else {
+            result.push_str(&numer_str);
+            result.push('/');
+            if analysis.denom.len() == 1 {
+                result.push_str(&self.format_pretty_denom_factor(&analysis.denom[0]));
+            } else {
+                result.push('(');
+                let parts: Vec<String> = analysis.denom.iter()
+                    .map(|df| self.format_pretty_denom_factor(df))
+                    .collect();
+                result.push_str(&parts.join("*"));
+                result.push(')');
+            }
+        }
+        result
+    }
+
+    fn format_pretty_denom_factor(&self, df: &DenomFactor<'_>) -> String {
+        match df.exp {
+            None => {
+                let s = df.base.format_pretty();
+                let needs_parens = matches!(df.base, SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. } | SymExpr::Neg { .. });
+                if needs_parens { format!("({})", s) } else { s }
+            }
+            Some(exp) => {
+                let base_s = df.base.format_pretty();
+                let needs_parens = matches!(df.base, SymExpr::BinOp { .. } | SymExpr::Neg { .. });
+                let base = if needs_parens { format!("({})", base_s) } else { base_s };
+                // Use superscript for the positive exponent if it's an integer
+                match exp {
+                    SymExpr::Int { value } if *value < 0 => format!("{}{}", base, to_superscript(-value)),
+                    SymExpr::Int { value } => format!("{}{}", base, to_superscript(*value)),
+                    _ => {
+                        if let Some(n) = exp.as_int() {
+                            format!("{}{}", base, to_superscript(n))
+                        } else {
+                            format!("{}^{}", base, exp.format_pretty())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn format_pretty_abs(&self, expr: &SymExpr) -> String {
+        match expr {
+            SymExpr::Neg { expr: inner } => {
+                let s = inner.format_pretty();
+                let needs_parens = matches!(inner.as_ref(), SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. });
+                if needs_parens { format!("({})", s) } else { s }
+            }
+            SymExpr::Int { value } => format!("{}", value.abs()),
+            SymExpr::Float { value } => {
+                let v = value.abs();
+                if v.fract() == 0.0 && v < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
+            }
+            SymExpr::BinOp { op: SymOp::Mul, .. } => {
+                let analysis = analyze_mul(expr);
+                // Format with negative suppressed — reuse logic
+                let mut s = String::new();
+                // Same as format_pretty_mul but without sign
+                let numer_str = if analysis.numer.is_empty() {
+                    "1".to_string()
+                } else {
+                    let mut parts = Vec::new();
+                    for (i, factor) in analysis.numer.iter().enumerate() {
+                        let fs = if analysis.negative && i == 0 {
+                            if let SymExpr::Int { value } = factor {
+                                if *value < 0 { format!("{}", -value) } else { factor.format_pretty() }
+                            } else { factor.format_pretty() }
+                        } else { factor.format_pretty() };
+                        let needs_parens = matches!(factor, SymExpr::BinOp { op: SymOp::Add | SymOp::Sub, .. } | SymExpr::Neg { .. });
+                        if needs_parens { parts.push(format!("({})", fs)); } else { parts.push(fs); }
+                    }
+                    parts.join("*")
+                };
+                if analysis.denom.is_empty() {
+                    s.push_str(&numer_str);
+                } else {
+                    s.push_str(&numer_str);
+                    s.push('/');
+                    if analysis.denom.len() == 1 {
+                        s.push_str(&expr.format_pretty_denom_factor(&analysis.denom[0]));
+                    } else {
+                        s.push('(');
+                        let parts: Vec<String> = analysis.denom.iter()
+                            .map(|df| expr.format_pretty_denom_factor(df))
+                            .collect();
+                        s.push_str(&parts.join("*"));
+                        s.push(')');
+                    }
+                }
+                s
+            }
+            _ => expr.format_pretty(),
+        }
+    }
+}
+
 impl fmt::Display for MathConst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

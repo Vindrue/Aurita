@@ -5,9 +5,10 @@ use ratatui::Frame;
 use crate::tui::theme::Theme;
 
 pub fn render_status_bar(frame: &mut Frame, area: Rect, cas_status: &str, session_name: Option<&str>) {
+    let version = env!("CARGO_PKG_VERSION");
     let left_text = match session_name {
-        Some(name) => format!(" Aurita v0.7.0 | {}", name),
-        None => " Aurita v0.7.0".to_string(),
+        Some(name) => format!(" Aurita v{} | {}", version, name),
+        None => format!(" Aurita v{}", version),
     };
     let right_text = format!("{} ", cas_status);
 

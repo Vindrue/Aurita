@@ -18,6 +18,13 @@ enum Signal {
     Continue,
 }
 
+/// Output display mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutputMode {
+    Simple,
+    Pretty,
+}
+
 /// The tree-walking evaluator.
 pub struct Evaluator {
     pub env: EnvRef,
@@ -25,6 +32,8 @@ pub struct Evaluator {
     pub output: Vec<String>,
     /// Optional CAS manager for symbolic operations (multiple backends).
     pub cas_manager: Option<CasManager>,
+    /// Output display mode (simple ASCII vs pretty Unicode).
+    pub output_mode: OutputMode,
 }
 
 impl Evaluator {
@@ -35,6 +44,7 @@ impl Evaluator {
             env,
             output: Vec::new(),
             cas_manager: None,
+            output_mode: OutputMode::Simple,
         }
     }
 
@@ -728,6 +738,7 @@ impl Evaluator {
             "backend" => Ok(Some(self.set_backend(args, span)?)),
             "using" => Ok(Some(self.eval_using(args, span)?)),
             "to" => Ok(Some(self.eval_unit_convert(args, span)?)),
+            "output" => Ok(Some(self.set_output_mode(args, span)?)),
             _ => Ok(None),
         }
     }
@@ -797,6 +808,29 @@ impl Evaluator {
             .map_err(|e| LangError::eval(format!("backend: {}", e)).with_span(span))?;
 
         Ok(Value::Str(format!("Backend set to {}", manager.status_display())))
+    }
+
+    fn set_output_mode(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        if args.len() != 1 {
+            return Err(LangError::arity("output: expected 1 argument: output(\"simple\"|\"pretty\")").with_span(span));
+        }
+        let val = self.eval_expr(&args[0])?;
+        let name = match &val {
+            Value::Str(s) => s.clone(),
+            Value::Symbolic(SymExpr::Sym { name }) => name.clone(),
+            _ => return Err(LangError::type_err("output: argument must be \"simple\" or \"pretty\"").with_span(span)),
+        };
+        match name.as_str() {
+            "simple" => {
+                self.output_mode = OutputMode::Simple;
+                Ok(Value::Str("Output mode: simple".to_string()))
+            }
+            "pretty" => {
+                self.output_mode = OutputMode::Pretty;
+                Ok(Value::Str("Output mode: pretty".to_string()))
+            }
+            _ => Err(LangError::eval(format!("output: unknown mode \"{}\", expected \"simple\" or \"pretty\"", name)).with_span(span)),
+        }
     }
 
     /// Evaluate an expression with a specific backend: using("maxima", dif(x^2, x))
@@ -1702,6 +1736,18 @@ mod tests {
         let mut e = Evaluator::new();
         eval_with(&mut e, "f(x) = x^2 + 1");
         assert_eq!(eval_with(&mut e, "f(5)"), Value::Number(Number::Int(26)));
+        assert_eq!(eval_with(&mut e, "f(2)"), Value::Number(Number::Int(5)));
+    }
+
+    #[test]
+    fn test_function_call_after_symbolic_use() {
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "g(x) = x^2 + 1");
+        // Use g symbolically first
+        let symbolic = eval_with(&mut e, "g(x)");
+        assert!(matches!(symbolic, Value::Symbolic(_)));
+        // Then call numerically
+        assert_eq!(eval_with(&mut e, "g(3)"), Value::Number(Number::Int(10)));
     }
 
     #[test]

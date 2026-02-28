@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -10,7 +10,7 @@ use ratatui_image::StatefulImage;
 use crate::lang::builtins::{numeric_eval_sym, BUILTIN_CONSTANTS};
 use crate::persistence;
 use crate::physics::constants;
-use crate::lang::eval::Evaluator;
+use crate::lang::eval::{Evaluator, OutputMode};
 use crate::lang::lexer::Lexer;
 use crate::lang::parser::Parser;
 use crate::lang::types::{Function, Value};
@@ -32,6 +32,14 @@ pub struct App {
     pub help: HelpPanel,
     pub session_name: Option<String>,
     pub config: persistence::config::Config,
+    /// Per-section sidebar scroll offsets: [constants, physics, variables, functions]
+    pub sidebar_scroll: [usize; 4],
+    /// Cached layout regions from last render for mouse hit-testing
+    layout_worksheet: Rect,
+    /// Per-section sidebar rects: [constants, physics, variables, functions]
+    layout_sidebar_sections: [Rect; 4],
+    /// Per-section max scroll values (updated during render)
+    sidebar_max_scroll: [usize; 4],
 }
 
 impl App {
@@ -46,6 +54,10 @@ impl App {
             help: HelpPanel::new(),
             session_name: None,
             config,
+            sidebar_scroll: [0; 4],
+            layout_worksheet: Rect::default(),
+            layout_sidebar_sections: [Rect::default(); 4],
+            sidebar_max_scroll: [0; 4],
         }
     }
 
@@ -65,6 +77,45 @@ impl App {
     }
 
     /// Key handling when the help panel is visible.
+    /// Handle a mouse event. Returns true if the screen should be redrawn.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.help.visible {
+                    self.help.scroll_up(3);
+                } else if let Some(i) = self.sidebar_section_at(pos) {
+                    self.sidebar_scroll[i] = self.sidebar_scroll[i].saturating_sub(1);
+                } else {
+                    self.worksheet.scroll_up(3);
+                }
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                if self.help.visible {
+                    self.help.scroll_down(3);
+                } else if let Some(i) = self.sidebar_section_at(pos) {
+                    let max = self.sidebar_max_scroll[i];
+                    self.sidebar_scroll[i] = (self.sidebar_scroll[i] + 1).min(max);
+                } else {
+                    self.worksheet.scroll_down(3, 50);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the sidebar section index (0-3) if the position is inside one.
+    fn sidebar_section_at(&self, pos: ratatui::layout::Position) -> Option<usize> {
+        for (i, rect) in self.layout_sidebar_sections.iter().enumerate() {
+            if rect.contains(pos) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn handle_key_help(&mut self, key: KeyEvent) -> bool {
         match key {
             KeyEvent { code: KeyCode::Esc, .. }
@@ -183,6 +234,29 @@ impl App {
                     if let Some((start, end, text)) = self.completion.accept() {
                         self.input.replace_range(start, end, &text);
                     }
+                }
+                true
+            }
+
+            // Sidebar scroll: Alt+Up / Alt+Down
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                for s in self.sidebar_scroll.iter_mut() {
+                    *s = s.saturating_sub(1);
+                }
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                for (i, s) in self.sidebar_scroll.iter_mut().enumerate() {
+                    let max = self.sidebar_max_scroll[i];
+                    *s = (*s + 1).min(max);
                 }
                 true
             }
@@ -377,9 +451,10 @@ impl App {
                 );
             }
             Ok(value) => {
+                let display = self.format_value(&value);
                 self.worksheet.add_entry(
                     input.to_string(),
-                    OutputKind::Value(format!("{}", value)),
+                    OutputKind::Value(display),
                     print_lines,
                 );
             }
@@ -394,6 +469,19 @@ impl App {
 
         // Auto-scroll to bottom
         self.worksheet.scroll_to_bottom(50);
+    }
+
+    /// Format a value for display, respecting the current output mode.
+    fn format_value(&self, value: &Value) -> String {
+        match self.evaluator.output_mode {
+            OutputMode::Pretty => {
+                match value {
+                    Value::Symbolic(expr) => expr.format_pretty(),
+                    _ => format!("{}", value),
+                }
+            }
+            OutputMode::Simple => format!("{}", value),
+        }
     }
 
     /// Execute a :command.
@@ -525,7 +613,8 @@ impl App {
                                 self.worksheet.add_entry(input.clone(), OutputKind::Plot(rendered), print_lines);
                             }
                             Ok(value) => {
-                                self.worksheet.add_entry(input.clone(), OutputKind::Value(format!("{}", value)), print_lines);
+                                let display = self.format_value(&value);
+                                self.worksheet.add_entry(input.clone(), OutputKind::Value(display), print_lines);
                             }
                             Err(err) => {
                                 self.worksheet.add_entry(input.clone(), OutputKind::Error(err.message), print_lines);
@@ -593,6 +682,7 @@ impl App {
         ])
         .split(outer[1]);
 
+        self.layout_worksheet = main[0];
         self.render_worksheet(frame, main[0]);
         self.render_sidebar(frame, main[1]);
         self.render_input(frame, outer[2]);
@@ -768,7 +858,7 @@ impl App {
         }
     }
 
-    fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
+    fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let has_hint = detect_active_function(&self.input.text, self.input.cursor).is_some();
         let hint_height = if has_hint { 4u16 } else { 0u16 };
 
@@ -781,6 +871,7 @@ impl App {
         ])
         .split(area);
 
+        self.layout_sidebar_sections = [sidebar[0], sidebar[1], sidebar[2], sidebar[3]];
         self.render_constants(frame, sidebar[0]);
         self.render_physics(frame, sidebar[1]);
         self.render_variables(frame, sidebar[2]);
@@ -790,7 +881,7 @@ impl App {
         }
     }
 
-    fn render_constants(&self, frame: &mut Frame, area: Rect) {
+    fn render_constants(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
@@ -800,7 +891,7 @@ impl App {
         frame.render_widget(block, area);
 
         let env = self.evaluator.env.borrow();
-        let mut items: Vec<ListItem> = Vec::new();
+        let mut all_items: Vec<ListItem> = Vec::new();
         for &name in BUILTIN_CONSTANTS {
             if let Some(val) = env.get(name) {
                 let approx = match &val {
@@ -817,7 +908,7 @@ impl App {
                     }
                     _ => format!("{}", val),
                 };
-                items.push(ListItem::new(Line::from(vec![
+                all_items.push(ListItem::new(Line::from(vec![
                     Span::styled(
                         name.to_string(),
                         Style::default().fg(ratatui::style::Color::Cyan),
@@ -828,11 +919,19 @@ impl App {
             }
         }
 
+        let max_scroll = all_items.len().saturating_sub(inner.height as usize);
+        self.sidebar_max_scroll[0] = max_scroll;
+        self.sidebar_scroll[0] = self.sidebar_scroll[0].min(max_scroll);
+        let items: Vec<ListItem> = all_items.into_iter()
+            .skip(self.sidebar_scroll[0])
+            .take(inner.height as usize)
+            .collect();
+
         let list = List::new(items);
         frame.render_widget(list, inner);
     }
 
-    fn render_physics(&self, frame: &mut Frame, area: Rect) {
+    fn render_physics(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
@@ -841,14 +940,10 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Show a curated set of the most commonly used physics constants
-        let show_names = ["c", "h", "hbar", "G", "k_B", "N_A", "e_charge", "m_e"];
+        let show_names = constants::all_names();
         let mut items: Vec<ListItem> = Vec::new();
 
         for &name in &show_names {
-            if items.len() >= inner.height as usize {
-                break;
-            }
             if let Some(pc) = constants::lookup(name) {
                 let val_str = if pc.uncertainty > 0.0 {
                     format!("{:.3e} +/-", pc.value)
@@ -873,11 +968,19 @@ impl App {
             }
         }
 
+        let max_scroll = items.len().saturating_sub(inner.height as usize);
+        self.sidebar_max_scroll[1] = max_scroll;
+        self.sidebar_scroll[1] = self.sidebar_scroll[1].min(max_scroll);
+        let items: Vec<ListItem> = items.into_iter()
+            .skip(self.sidebar_scroll[1])
+            .take(inner.height as usize)
+            .collect();
+
         let list = List::new(items);
         frame.render_widget(list, inner);
     }
 
-    fn render_variables(&self, frame: &mut Frame, area: Rect) {
+    fn render_variables(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
@@ -888,14 +991,13 @@ impl App {
 
         let physics_names = constants::all_names();
         let bindings = self.evaluator.env.borrow().all_bindings();
-        let items: Vec<ListItem> = bindings
+        let all_items: Vec<ListItem> = bindings
             .iter()
             .filter(|(name, v)| {
                 !matches!(v, Value::Function(_))
                     && !BUILTIN_CONSTANTS.contains(&name.as_str())
                     && !physics_names.contains(&name.as_str())
             })
-            .take(inner.height as usize)
             .map(|(name, value)| {
                 let display = format!("{}", value);
                 let truncated = if display.len() > (inner.width as usize).saturating_sub(name.len() + 4) {
@@ -911,11 +1013,19 @@ impl App {
             })
             .collect();
 
+        let max_scroll = all_items.len().saturating_sub(inner.height as usize);
+        self.sidebar_max_scroll[2] = max_scroll;
+        self.sidebar_scroll[2] = self.sidebar_scroll[2].min(max_scroll);
+        let items: Vec<ListItem> = all_items.into_iter()
+            .skip(self.sidebar_scroll[2])
+            .take(inner.height as usize)
+            .collect();
+
         let list = List::new(items);
         frame.render_widget(list, inner);
     }
 
-    fn render_functions(&self, frame: &mut Frame, area: Rect) {
+    fn render_functions(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
@@ -925,17 +1035,24 @@ impl App {
         frame.render_widget(block, area);
 
         let bindings = self.evaluator.env.borrow().all_bindings();
-        let items: Vec<ListItem> = bindings
+        let all_items: Vec<ListItem> = bindings
             .iter()
             .filter_map(|(name, v)| match v {
-                Value::Function(Function::UserDefined { params, .. }) => {
+                Value::Function(Function::UserDefined { .. }) => {
                     Some(ListItem::new(Span::styled(
-                        format!("{}({})", name, params.join(", ")),
+                        name.to_string(),
                         Theme::sidebar_item(),
                     )))
                 }
                 _ => None,
             })
+            .collect();
+
+        let max_scroll = all_items.len().saturating_sub(inner.height as usize);
+        self.sidebar_max_scroll[3] = max_scroll;
+        self.sidebar_scroll[3] = self.sidebar_scroll[3].min(max_scroll);
+        let items: Vec<ListItem> = all_items.into_iter()
+            .skip(self.sidebar_scroll[3])
             .take(inner.height as usize)
             .collect();
 
