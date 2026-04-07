@@ -72,6 +72,40 @@ impl UnitExpr {
             cd: -self.cd,
         }
     }
+
+    /// Try to express this unit as a known derived SI unit name.
+    /// Returns Some("N"), Some("Pa"), etc. if dimensions exactly match a derived unit.
+    pub fn reduce_to_derived(&self) -> Option<&'static str> {
+        for &(name, mult, dims) in NAMED_UNITS {
+            // Only consider derived units with multiplier 1.0 (true SI derived)
+            // Skip base units (they're already simple) and practical units (eV, L)
+            if mult != 1.0 {
+                continue;
+            }
+            // Skip base units and dimensionless — those don't need reduction
+            match name {
+                "m" | "kg" | "s" | "A" | "K" | "mol" | "cd" | "rad" | "sr" => continue,
+                _ => {}
+            }
+            if dims == *self {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Format this unit using derived SI names where possible.
+    pub fn display_reduced(&self) -> String {
+        if self.is_dimensionless() {
+            return String::new();
+        }
+        // Try exact match first
+        if let Some(name) = self.reduce_to_derived() {
+            return name.to_string();
+        }
+        // Fall back to standard base-unit display
+        format!("{}", self)
+    }
 }
 
 impl fmt::Display for UnitExpr {
@@ -314,6 +348,17 @@ impl UnitParser {
             return Ok(result);
         }
 
+        // Handle numeric literal (e.g. "1" in "1/s")
+        if self.peek().map_or(false, |c| c.is_ascii_digit()) {
+            let start = self.pos;
+            while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            let digits: String = self.chars[start..self.pos].iter().collect();
+            let n: f64 = digits.parse().map_err(|_| format!("invalid number in unit: {}", digits))?;
+            return Ok((n, UnitExpr::dimensionless()));
+        }
+
         // Read identifier
         let start = self.pos;
         while self.pos < self.chars.len() {
@@ -336,6 +381,14 @@ impl UnitParser {
 
     fn parse_integer(&mut self) -> Result<i8, String> {
         self.skip_spaces();
+
+        // Handle parenthesized exponent e.g. ^(-1)
+        let parens = self.peek() == Some('(');
+        if parens {
+            self.advance();
+            self.skip_spaces();
+        }
+
         let mut neg = false;
         if self.peek() == Some('-') {
             neg = true;
@@ -353,6 +406,15 @@ impl UnitParser {
 
         let digits: String = self.chars[start..self.pos].iter().collect();
         let n: i8 = digits.parse().map_err(|_| format!("invalid exponent: {}", digits))?;
+
+        if parens {
+            self.skip_spaces();
+            if self.peek() != Some(')') {
+                return Err("expected ')' after exponent".to_string());
+            }
+            self.advance();
+        }
+
         Ok(if neg { -n } else { n })
     }
 
@@ -495,5 +557,78 @@ mod tests {
     #[test]
     fn test_parse_unknown_unit() {
         assert!(parse_unit_expr("xyz").is_err());
+    }
+
+    #[test]
+    fn test_reduce_newton() {
+        let u = UnitExpr { m: 1, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.reduce_to_derived(), Some("N"));
+    }
+
+    #[test]
+    fn test_reduce_pascal() {
+        let u = UnitExpr { m: -1, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.reduce_to_derived(), Some("Pa"));
+    }
+
+    #[test]
+    fn test_reduce_joule() {
+        let u = UnitExpr { m: 2, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.reduce_to_derived(), Some("J"));
+    }
+
+    #[test]
+    fn test_reduce_hertz() {
+        let u = UnitExpr { m: 0, kg: 0, s: -1, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.reduce_to_derived(), Some("Hz"));
+    }
+
+    #[test]
+    fn test_reduce_base_unit_not_reduced() {
+        // Pure base units should not be "reduced"
+        assert_eq!(UNIT_M.reduce_to_derived(), None);
+        assert_eq!(UNIT_KG.reduce_to_derived(), None);
+    }
+
+    #[test]
+    fn test_reduce_no_match() {
+        // kg/s^2 doesn't match any derived unit
+        let u = UnitExpr { m: 0, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.reduce_to_derived(), None);
+    }
+
+    #[test]
+    fn test_display_reduced() {
+        let u = UnitExpr { m: -1, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u.display_reduced(), "Pa");
+        // Fallback to base units when no match
+        let u2 = UnitExpr { m: 0, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 };
+        assert_eq!(u2.display_reduced(), "kg/s^2");
+    }
+
+    #[test]
+    fn test_parse_inverse_unit_with_1() {
+        // 1/s should give Hz dimensions
+        let (mult, dims) = parse_unit_expr("1/s").unwrap();
+        assert_eq!(mult, 1.0);
+        assert_eq!(dims.s, -1);
+        assert_eq!(dims.m, 0);
+    }
+
+    #[test]
+    fn test_parse_inverse_unit_paren_exponent() {
+        // s^(-1) should give Hz dimensions
+        let (mult, dims) = parse_unit_expr("s^(-1)").unwrap();
+        assert_eq!(mult, 1.0);
+        assert_eq!(dims.s, -1);
+        assert_eq!(dims.m, 0);
+    }
+
+    #[test]
+    fn test_parse_inverse_compound() {
+        // kg*m*s^(-2) = Newton
+        let (mult, dims) = parse_unit_expr("kg*m*s^(-2)").unwrap();
+        assert_eq!(mult, 1.0);
+        assert_eq!(dims, UnitExpr { m: 1, kg: 1, s: -2, a: 0, k: 0, mol: 0, cd: 0 });
     }
 }

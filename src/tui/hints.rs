@@ -15,7 +15,7 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "dif",      signature: "dif(expr, var?, order?)",         description: "Differentiate expression" },
     FuncHint { name: "int",      signature: "int(expr, var?, lo..hi or lo, hi)", description: "Integrate expression" },
     FuncHint { name: "solve",    signature: "solve(expr, var?)",               description: "Solve equation for variable" },
-    FuncHint { name: "simplify", signature: "simplify(expr)",                  description: "Simplify expression" },
+    FuncHint { name: "simplify", signature: "simplify(expr) or simplify(true|false)", description: "Simplify expression or toggle auto-simplify" },
     FuncHint { name: "expand",   signature: "expand(expr)",                    description: "Expand expression" },
     FuncHint { name: "factor",   signature: "factor(expr)",                    description: "Factor expression" },
     FuncHint { name: "lim",      signature: "lim(expr, var, point, dir?)",     description: "Compute limit" },
@@ -25,6 +25,7 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "plot",     signature: "plot(expr, range?) or plot([e1, e2, ...], range?)", description: "Plot expression(s)" },
     // Numeric eval
     FuncHint { name: "eval",     signature: "eval(expr)",                      description: "Force numeric evaluation" },
+    FuncHint { name: "component", signature: "component(expr or vec)",          description: "Decompose into components (a+bi or e_n)" },
     // Backend control
     FuncHint { name: "backend",  signature: "backend(\"sympy\"|\"maxima\"|\"both\")", description: "Set active CAS backend" },
     FuncHint { name: "using",    signature: "using(\"backend\", expr)",        description: "Evaluate with specific backend" },
@@ -42,6 +43,8 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "ln",       signature: "ln(x)",      description: "Natural logarithm" },
     FuncHint { name: "sqrt",     signature: "sqrt(x)",    description: "Square root" },
     FuncHint { name: "abs",      signature: "abs(x)",     description: "Absolute value" },
+    FuncHint { name: "abs2",     signature: "abs2(x)",    description: "Absolute value squared (|x|²)" },
+    FuncHint { name: "conj",     signature: "conj(x)",    description: "Complex conjugate" },
     FuncHint { name: "floor",    signature: "floor(x)",   description: "Floor (round down)" },
     FuncHint { name: "ceil",     signature: "ceil(x)",    description: "Ceiling (round up)" },
     FuncHint { name: "round",    signature: "round(x)",   description: "Round to nearest integer" },
@@ -60,6 +63,17 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "nominal",     signature: "nominal(x)",            description: "Extract nominal value from quantity" },
     FuncHint { name: "units",       signature: "units(x)",              description: "Get unit string of quantity" },
     FuncHint { name: "to",          signature: "to(quantity, \"unit\")", description: "Convert quantity to different unit" },
+    // Vector calculus
+    FuncHint { name: "grad",         signature: "grad(expr, [vars])",            description: "Gradient of scalar expression" },
+    FuncHint { name: "divg",         signature: "divg([field], [vars])",         description: "Divergence of vector field" },
+    FuncHint { name: "curl",         signature: "curl([field], [vars])",         description: "Curl of vector field (2D or 3D)" },
+    // Vector constructor
+    FuncHint { name: "vec",          signature: "vec(a, b, ...)",                description: "Create vector from arguments" },
+    // Settings
+    FuncHint { name: "output",       signature: "output(\"simple\"|\"pretty\")", description: "Set output display mode" },
+    FuncHint { name: "reduceunits",  signature: "reduceunits(true|false)",       description: "Toggle derived SI unit display" },
+    // Statistics
+    FuncHint { name: "pdiff",        signature: "pdiff(a, b)",                   description: "Percent difference vs average" },
 ];
 
 /// Detect the innermost function call surrounding the cursor position.

@@ -670,7 +670,7 @@ impl SymExpr {
     }
 
     /// Extract integer value if this is an Int node.
-    fn as_int(&self) -> Option<i64> {
+    pub fn as_int(&self) -> Option<i64> {
         match self {
             SymExpr::Int { value } => Some(*value),
             _ => None,

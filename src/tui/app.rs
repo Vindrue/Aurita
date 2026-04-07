@@ -14,6 +14,7 @@ use crate::lang::eval::{Evaluator, OutputMode};
 use crate::lang::lexer::Lexer;
 use crate::lang::parser::Parser;
 use crate::lang::types::{Function, Value};
+use crate::symbolic::expr::SymExpr;
 use crate::tui::completion::CompletionState;
 use crate::tui::help::HelpPanel;
 use crate::tui::hints::detect_active_function;
@@ -40,6 +41,9 @@ pub struct App {
     layout_sidebar_sections: [Rect; 4],
     /// Per-section max scroll values (updated during render)
     sidebar_max_scroll: [usize; 4],
+    /// Bridge script paths for CAS re-init on @clearall
+    pub sympy_bridge_path: Option<String>,
+    pub maxima_bridge_path: Option<String>,
 }
 
 impl App {
@@ -58,6 +62,8 @@ impl App {
             layout_worksheet: Rect::default(),
             layout_sidebar_sections: [Rect::default(); 4],
             sidebar_max_scroll: [0; 4],
+            sympy_bridge_path: None,
+            maxima_bridge_path: None,
         }
     }
 
@@ -433,6 +439,7 @@ impl App {
             return;
         }
 
+
         self.evaluator.output.clear();
 
         let result = Lexer::new(input)
@@ -451,12 +458,21 @@ impl App {
                 );
             }
             Ok(value) => {
-                let display = self.format_value(&value);
-                self.worksheet.add_entry(
-                    input.to_string(),
-                    OutputKind::Value(display),
-                    print_lines,
-                );
+                // Detect undefined variables and functions
+                if let Some(err_msg) = self.check_undefined(&value, input) {
+                    self.worksheet.add_entry(
+                        input.to_string(),
+                        OutputKind::Error(err_msg),
+                        print_lines,
+                    );
+                } else {
+                    let display = self.format_value(&value);
+                    self.worksheet.add_entry(
+                        input.to_string(),
+                        OutputKind::Value(display),
+                        print_lines,
+                    );
+                }
             }
             Err(err) => {
                 self.worksheet.add_entry(
@@ -471,8 +487,38 @@ impl App {
         self.worksheet.scroll_to_bottom(50);
     }
 
+    /// Check if a result represents an undefined variable or function.
+    /// Returns an error message if so, None if the result is legitimate.
+    fn check_undefined(&self, value: &Value, input: &str) -> Option<String> {
+        match value {
+            // Bare symbolic variable — only error if the input is just that identifier
+            Value::Symbolic(SymExpr::Sym { name }) => {
+                if input.trim() == name {
+                    Some(format!("undefined variable '{}'", name))
+                } else {
+                    None
+                }
+            }
+            // Symbolic function call with unknown function name
+            Value::Symbolic(SymExpr::Func { name, .. }) => {
+                if !is_known_function(name) {
+                    Some(format!("undefined function '{}'", name))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Format a value for display, respecting the current output mode.
     fn format_value(&self, value: &Value) -> String {
+        // Handle reduce_units for Quantity values
+        if self.evaluator.reduce_units {
+            if let Value::Quantity(q) = value {
+                return q.display_reduced();
+            }
+        }
         match self.evaluator.output_mode {
             OutputMode::Pretty => {
                 match value {
@@ -496,6 +542,14 @@ impl App {
             }
             "clear" => {
                 self.worksheet = WorksheetState::new();
+            }
+            "clearall" => {
+                self.worksheet = WorksheetState::new();
+                self.evaluator = Evaluator::new();
+                self.evaluator.init_cas(
+                    self.sympy_bridge_path.as_deref(),
+                    self.maxima_bridge_path.as_deref(),
+                );
             }
             "save" => {
                 self.command_save(arg);
@@ -1236,4 +1290,26 @@ impl App {
         let cursor_y = inner.y;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// Check if a function name is known (builtin math, CAS op, or utility).
+fn is_known_function(name: &str) -> bool {
+    matches!(
+        name,
+        // Math builtins (symbolic lift)
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "sinh" | "cosh" | "tanh"
+        | "exp" | "ln" | "log" | "sqrt"
+        | "abs" | "abs2" | "conj"
+        | "sign" | "floor" | "ceil" | "round"
+        // CAS operations
+        | "dif" | "int" | "solve" | "simplify" | "expand" | "factor"
+        | "lim" | "taylor" | "tex"
+        // Vector calculus
+        | "grad" | "divg" | "curl"
+        // Utility
+        | "print" | "len" | "typeof" | "eval" | "max" | "min"
+        | "pm" | "uncertainty" | "nominal" | "units" | "pdiff" | "vec"
+        | "plot" | "backend" | "using" | "to" | "output" | "reduceunits"
+    )
 }

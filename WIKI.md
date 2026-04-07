@@ -12,6 +12,7 @@ Aurita is a terminal-based computer algebra system built in Rust. It combines a 
 - [Vectors](#vectors)
 - [Control Flow](#control-flow)
 - [Symbolic Math (CAS)](#symbolic-math-cas)
+- [Vector Calculus](#vector-calculus)
 - [Plotting](#plotting)
 - [Physics: Units & Measurements](#physics-units--measurements)
 - [CODATA Constants](#codata-constants)
@@ -44,14 +45,6 @@ Aurita requires a Kitty-compatible terminal for inline plot display. SymPy (Pyth
 10 / 2             # 5 (integer preserved)
 2 ^ 10             # 1024
 17 % 5             # 2
-```
-
-### Implicit Multiplication
-
-```
-3x                 # 3 * x
-2(x + 1)           # 2 * (x + 1)
-2pi                # 2 * pi
 ```
 
 ### Variables
@@ -109,6 +102,7 @@ g(3, 4)            # 25
 | `sign(x)` | Sign (-1, 0, or 1) |
 | `max(a, b, ...)` | Maximum |
 | `min(a, b, ...)` | Minimum |
+| `pdiff(a, b)` | Percent difference vs average |
 
 ### Utility Functions
 
@@ -130,6 +124,13 @@ v = [1, 2, 3]
 v[1]               # 1
 v[3]               # 3
 len(v)             # 3
+```
+
+The `vec()` function creates vectors from arguments (useful for single-element vectors to avoid unit annotation ambiguity):
+
+```
+vec(5)                    # [5]
+vec(1, 2, 3)              # [1, 2, 3]
 ```
 
 Element-wise arithmetic:
@@ -248,6 +249,34 @@ using("maxima", dif(x^2, x))   # one-off with specific backend
 
 ---
 
+## Vector Calculus
+
+All vector calculus operations require CAS (SymPy).
+
+### Gradient
+
+```
+grad(x^2*y + y^3, [x, y])         # [2*x*y, x^2 + 3*y^2]
+grad(x*y*z, [x, y, z])            # [y*z, x*z, x*y]
+```
+
+### Divergence
+
+```
+divg([x^2, y^3, z^2], [x, y, z])  # 2*x + 3*y^2 + 2*z
+```
+
+### Curl
+
+```
+curl([x*y*z, x*y*z, x*y*z], [x, y, z])  # 3D curl
+curl([x*y, -x*y], [x, y])                # 2D → 3D: [0, 0, ...]
+```
+
+2D curl returns a 3D vector `[0, 0, dFy/dx - dFx/dy]` to preserve mathematical convention.
+
+---
+
 ## Plotting
 
 ```
@@ -296,6 +325,20 @@ to(1[eV], "J")     # 1.602e-19 [J]
 
 **SI Prefixes:** T (10^12), G (10^9), M (10^6), k (10^3), m (10^-3), u/&mu; (10^-6), n (10^-9), p (10^-12), f (10^-15)
 
+### Derived Unit Display
+
+By default, units are shown in base SI form (e.g. `kg/(m*s^2)` for Pascals). Enable derived unit reduction to show named units:
+
+```
+3[Pa]                  # 3.0 [kg/(m*s^2)]   (default)
+reduceunits(true)      # Reduce units: on
+3[Pa]                  # 3.0 [Pa]
+5[N]                   # 5.0 [N]            (instead of kg*m/s^2)
+reduceunits(false)     # Reduce units: off
+```
+
+Recognized derived units: N, J, W, Pa, Hz, C, V, Ohm, F, H, T, Wb, S. Falls back to base units when no exact match exists.
+
 ### Measurements with Uncertainty
 
 Create measurements with the `+/-` operator or `pm()` function:
@@ -328,6 +371,8 @@ sin(1.0 +/- 0.01) # 0.8415 +/- 0.0054       (derivative-based)
 | `nominal(x)` | Extract nominal value |
 | `units(x)` | Get unit string |
 | `to(quantity, "unit")` | Convert to different unit |
+| `pdiff(a, b)` | Percent difference vs average: `2*|a-b|/|a+b| * 100` |
+| `reduceunits(true\|false)` | Toggle derived SI unit display (Pa, N, J, ...) |
 
 ---
 
@@ -377,6 +422,7 @@ Commands start with `:` and are distinct from math expressions.
 | `:load <name>` | Load and replay a saved session |
 | `:sessions` | List all saved sessions |
 | `:clear` | Clear the worksheet |
+| `:clearall` | Clear worksheet and reset all variables/functions |
 | `:help` | Toggle the help panel |
 
 Sessions are stored as JSON in `~/.local/share/aurita/sessions/`. Loading a session replays all inputs to rebuild the full environment state.

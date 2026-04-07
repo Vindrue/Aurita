@@ -190,10 +190,14 @@ def symexpr_to_maxima(node):
         func_map = {
             "ln": "log",
             "abs": "abs",
+            "conj": "conjugate",
             "ceil": "ceiling",
             "floor": "floor",
             "erf": "erf",
         }
+        if fname == "abs2":
+            inner = ', '.join(args)
+            return f"abs({inner})^2"
         mname = func_map.get(fname, fname)
         return f"{mname}({', '.join(args)})"
     elif t == "Vector":
@@ -427,6 +431,17 @@ def handle_request(maxima, req):
                 "status": "ok",
                 "result": {"type": "Sym", "name": latex_str},
                 "latex": latex_str,
+            }
+
+        elif op_name == "component":
+            mexpr = symexpr_to_maxima(params["expr"])
+            # Extract real and imaginary parts via rectform
+            re_result = maxima.execute(f"realpart(rectform({mexpr}));")
+            im_result = maxima.execute(f"imagpart(rectform({mexpr}));")
+            return {
+                "id": req_id,
+                "status": "ok",
+                "results": [maxima_to_symexpr(re_result), maxima_to_symexpr(im_result)],
             }
 
         elif op_name == "lambdify":

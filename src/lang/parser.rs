@@ -55,7 +55,7 @@ impl Parser {
     fn parse_expr_or_assign(&mut self) -> LangResult<Stmt> {
         let expr = self.parse_expr(0)?;
 
-        // Check for assignment: `a = 5` or function def: `f(x) = 3x`
+        // Check for assignment: `a = 5` or function def: `f(x) = x^2 + 1`
         if self.peek_kind() == TokenKind::Eq {
             let eq_span = self.advance().span;
             let value = self.parse_expr(0)?;
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_func_def() {
-        let stmts = parse("f(x) = 3x + 1");
+        let stmts = parse("f(x) = 3*x + 1");
         match &stmts[0] {
             Stmt::FuncDef { name, params, .. } => {
                 assert_eq!(name, "f");
@@ -700,19 +700,6 @@ mod tests {
             expr,
             Expr::UnaryOp {
                 op: UnaryOpKind::Neg,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_implicit_mul() {
-        // 3x should parse as 3 * x
-        let expr = parse_expr("3x");
-        assert!(matches!(
-            expr,
-            Expr::BinOp {
-                op: BinOpKind::Mul,
                 ..
             }
         ));

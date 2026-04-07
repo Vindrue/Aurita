@@ -94,7 +94,7 @@ fn test_cas_solve() {
 
 #[test]
 fn test_cas_simplify() {
-    let result = eval_str("simplify(x^2 + 2x + 1)");
+    let result = eval_str("simplify(x^2 + 2*x + 1)");
     // (x + 1)^2
     assert!(result.contains("x") && result.contains("1"),
         "Expected simplified form, got: {}", result);
@@ -159,10 +159,6 @@ fn test_gaussian_definite_integral() {
     assert!(result.contains("sqrt") && result.contains("pi"),
         "Expected sqrt(pi/a) or similar, got: {}", result);
 
-    // Space-separated implicit mul also works
-    let result2 = eval_str("int(e^(-a x^2), x, -inf, inf)");
-    assert!(result2.contains("sqrt") && result2.contains("pi"),
-        "Expected sqrt(pi/a) or similar, got: {}", result2);
 }
 
 #[test]
@@ -336,7 +332,7 @@ fn test_maxima_solve() {
 #[test]
 fn test_maxima_simplify() {
     if !has_maxima() { return; }
-    let result = eval_maxima_str("simplify(x^2 + 2x + 1)");
+    let result = eval_maxima_str("simplify(x^2 + 2*x + 1)");
     // ratsimp should produce (x+1)^2 or x^2+2*x+1
     assert!(result.contains("x"),
         "Expected expression with x, got: {}", result);
@@ -728,4 +724,529 @@ fn test_vector_indexing_no_regression() {
         "v[2]",
     ]).unwrap();
     assert_eq!(format!("{}", results[1]), "20");
+}
+
+// =============================================================================
+// grad() — gradient (CAS/SymPy)
+// =============================================================================
+
+#[test]
+fn test_grad_basic_2d() {
+    // grad(x*y, [x, y]) = [y, x]
+    let result = eval_str("grad(x*y, [x, y])");
+    assert!(result.contains("y") && result.contains("x"),
+        "Expected [y, x], got: {}", result);
+}
+
+#[test]
+fn test_grad_basic_3d() {
+    // grad(x^2 + y^2 + z^2, [x, y, z]) = [2*x, 2*y, 2*z]
+    let result = eval_str("grad(x^2 + y^2 + z^2, [x, y, z])");
+    assert!(result.contains("2*x") && result.contains("2*y") && result.contains("2*z"),
+        "Expected [2*x, 2*y, 2*z], got: {}", result);
+}
+
+#[test]
+fn test_grad_constant_expression() {
+    // grad(5, [x, y]) = [0, 0]
+    let result = eval_str("grad(5, [x, y])");
+    assert!(result.contains("0"),
+        "Gradient of constant should be zero, got: {}", result);
+}
+
+#[test]
+fn test_grad_single_variable() {
+    // grad(x^3, [x]) = [3*x^2]
+    let result = eval_str("grad(x^3, [x])");
+    assert!(result.contains("3") && result.contains("x"),
+        "Expected [3*x^2], got: {}", result);
+}
+
+#[test]
+fn test_grad_complex_expression() {
+    // grad(sin(x)*cos(y), [x, y])
+    // = [cos(x)*cos(y), -sin(x)*sin(y)]
+    let result = eval_str("grad(sin(x)*cos(y), [x, y])");
+    assert!(result.contains("cos") && result.contains("sin"),
+        "Expected trig derivatives, got: {}", result);
+}
+
+#[test]
+fn test_grad_4d() {
+    // grad should work for arbitrary dimension
+    // Use variable names that don't clash with CODATA constants
+    // grad(p + q + r + s, [p, q, r, s]) = [1, 1, 1, 1]
+    let result = eval_str("grad(p + q + r + s, [p, q, r, s])");
+    assert!(result.contains("1"),
+        "Expected [1, 1, 1, 1], got: {}", result);
+}
+
+#[test]
+fn test_grad_partial_dependence() {
+    // grad(x^2, [x, y]) = [2*x, 0] — only depends on x
+    let result = eval_str("grad(x^2, [x, y])");
+    assert!(result.contains("2*x") && result.contains("0"),
+        "Expected [2*x, 0], got: {}", result);
+}
+
+#[test]
+fn test_grad_exponential() {
+    // grad(exp(x*y), [x, y]) = [y*exp(x*y), x*exp(x*y)]
+    let result = eval_str("grad(exp(x*y), [x, y])");
+    assert!(result.contains("exp"),
+        "Expected exponentials in gradient, got: {}", result);
+}
+
+#[test]
+fn test_grad_wrong_arg_count() {
+    // grad needs exactly 2 args
+    let result = eval_with_cas("grad(x^2)");
+    assert!(result.is_err(), "grad with 1 argument should error");
+}
+
+#[test]
+fn test_grad_wrong_arg_count_three() {
+    let result = eval_with_cas("grad(x^2, [x], [y])");
+    assert!(result.is_err(), "grad with 3 arguments should error");
+}
+
+// =============================================================================
+// divg() — divergence (CAS/SymPy)
+// =============================================================================
+
+#[test]
+fn test_divg_basic_3d() {
+    // divg([x^2, y^3, z^2], [x, y, z]) = 2*x + 3*y^2 + 2*z
+    let result = eval_str("divg([x^2, y^3, z^2], [x, y, z])");
+    assert!(result.contains("2*x") && result.contains("2*z"),
+        "Expected 2*x + 3*y^2 + 2*z, got: {}", result);
+}
+
+#[test]
+fn test_divg_basic_2d() {
+    // divg([x, y], [x, y]) = 1 + 1 = 2
+    let result = eval_str("divg([x, y], [x, y])");
+    assert!(result == "2" || result == "2.0",
+        "Expected 2, got: {}", result);
+}
+
+#[test]
+fn test_divg_no_dependence_on_own_var() {
+    // divg([y, x], [x, y]) = d(y)/dx + d(x)/dy = 0 + 0 = 0
+    let result = eval_str("divg([y, x], [x, y])");
+    assert!(result == "0" || result == "0.0",
+        "Expected 0, got: {}", result);
+}
+
+#[test]
+fn test_divg_complex_field() {
+    // divg([sin(x), cos(y), exp(z)], [x, y, z])
+    // = cos(x) - sin(y) + exp(z)
+    let result = eval_str("divg([sin(x), cos(y), exp(z)], [x, y, z])");
+    assert!(result.contains("cos") && result.contains("sin") && result.contains("exp"),
+        "Expected cos(x) - sin(y) + exp(z), got: {}", result);
+}
+
+#[test]
+fn test_divg_dimension_mismatch() {
+    // Field has 3 components but only 2 variables
+    let result = eval_with_cas("divg([x, y, z], [x, y])");
+    assert!(result.is_err(), "divg dimension mismatch should error");
+}
+
+#[test]
+fn test_divg_dimension_mismatch_reversed() {
+    // Field has 2 components but 3 variables
+    let result = eval_with_cas("divg([x, y], [x, y, z])");
+    assert!(result.is_err(), "divg dimension mismatch should error");
+}
+
+#[test]
+fn test_divg_constant_field() {
+    // divg([1, 2, 3], [x, y, z]) = 0
+    let result = eval_str("divg([1, 2, 3], [x, y, z])");
+    assert!(result == "0" || result == "0.0",
+        "Divergence of constant field should be 0, got: {}", result);
+}
+
+#[test]
+fn test_divg_wrong_arg_count() {
+    let result = eval_with_cas("divg([x, y, z])");
+    assert!(result.is_err(), "divg with 1 argument should error");
+}
+
+// =============================================================================
+// curl() — curl (CAS/SymPy)
+// =============================================================================
+
+#[test]
+fn test_curl_basic_3d() {
+    // curl([y, -x, 0], [x, y, z]) = [0, 0, -1 - 1] = [0, 0, -2]
+    let result = eval_str("curl([y, -x, 0], [x, y, z])");
+    assert!(result.contains("-2") || result.contains("- 2"),
+        "Expected [0, 0, -2], got: {}", result);
+}
+
+#[test]
+fn test_curl_2d_returns_3d() {
+    // curl([y, -x], [x, y]) should return [0, 0, dFy/dx - dFx/dy] = [0, 0, -1 - 1] = [0, 0, -2]
+    let result = eval_str("curl([y, -x], [x, y])");
+    // Should be a 3D vector
+    let display = result.clone();
+    assert!(display.contains("0"),
+        "2D curl should have zero components, got: {}", display);
+    assert!(display.contains("-2") || display.contains("- 2"),
+        "Expected z-component -2, got: {}", display);
+}
+
+#[test]
+fn test_curl_irrotational_field() {
+    // curl(grad(f)) = 0 for any scalar field
+    // grad(x^2*y + y^2*z) = [2*x*y, x^2 + 2*y*z, y^2]
+    // curl of that should be [0, 0, 0]
+    let result = eval_str("curl([2*x*y, x^2 + 2*y*z, y^2], [x, y, z])");
+    // All components should simplify to 0
+    // dFz/dy - dFy/dz = 2*y - 2*y = 0
+    // dFx/dz - dFz/dx = 0 - 0 = 0
+    // dFy/dx - dFx/dy = 2*x - 2*x = 0
+    assert!(result.contains("0"),
+        "Curl of gradient should be zero, got: {}", result);
+}
+
+#[test]
+fn test_curl_complex_3d() {
+    // curl([x*z, y*z, x*y], [x, y, z])
+    // = [d(x*y)/dy - d(y*z)/dz, d(x*z)/dz - d(x*y)/dx, d(y*z)/dx - d(x*z)/dy]
+    // = [x - y, x - y, -z + 0]... let me just check it runs and produces a vector
+    let result = eval_str("curl([x*z, y*z, x*y], [x, y, z])");
+    // Should contain variable names — it's a nontrivial result
+    assert!(result.contains("x") || result.contains("y") || result.contains("z"),
+        "Expected symbolic curl result, got: {}", result);
+}
+
+#[test]
+fn test_curl_dimension_mismatch() {
+    // curl with mismatched field/vars dimensions
+    let result = eval_with_cas("curl([x, y, z], [x, y])");
+    assert!(result.is_err(), "curl dimension mismatch should error");
+}
+
+#[test]
+fn test_curl_1d_error() {
+    // curl only works for 2D and 3D
+    let result = eval_with_cas("curl([x], [x])");
+    assert!(result.is_err(), "curl with 1D field should error");
+}
+
+#[test]
+fn test_curl_4d_error() {
+    // curl only works for 2D and 3D
+    let result = eval_with_cas("curl([a, b, c, d], [w, x, y, z])");
+    assert!(result.is_err(), "curl with 4D field should error");
+}
+
+#[test]
+fn test_curl_wrong_arg_count() {
+    let result = eval_with_cas("curl([x, y, z])");
+    assert!(result.is_err(), "curl with 1 argument should error");
+}
+
+#[test]
+fn test_curl_2d_simple() {
+    // curl([0, x], [x, y]) = [0, 0, d(x)/dx - d(0)/dy] = [0, 0, 1]
+    let result = eval_str("curl([0, x], [x, y])");
+    assert!(result.contains("1"),
+        "Expected [0, 0, 1], got: {}", result);
+}
+
+// =============================================================================
+// Cross-feature / composition tests
+// =============================================================================
+
+#[test]
+fn test_grad_then_divg_laplacian() {
+    // div(grad(f)) = Laplacian
+    // For f = x^2 + y^2 + z^2:
+    // grad = [2*x, 2*y, 2*z], div(grad) = 2 + 2 + 2 = 6
+    // We need to do this in multiple steps using the evaluator
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "g = grad(x^2 + y^2 + z^2, [x, y, z])",
+        "divg(g, [x, y, z])",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result == "6" || result == "6.0",
+        "Laplacian of x^2+y^2+z^2 should be 6, got: {}", result);
+}
+
+#[test]
+fn test_curl_of_gradient_is_zero() {
+    // curl(grad(f)) = 0 for any scalar f
+    // f = x*y*z, grad = [y*z, x*z, x*y]
+    // curl of that should be zero
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "g = grad(x*y*z, [x, y, z])",
+        "curl(g, [x, y, z])",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result.contains("0"),
+        "curl(grad(f)) should be zero, got: {}", result);
+}
+
+#[test]
+fn test_divg_of_curl_is_zero() {
+    // div(curl(F)) = 0 for any vector field F
+    // F = [x*y, y*z, z*x]
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "c = curl([x*y, y*z, z*x], [x, y, z])",
+        "divg(c, [x, y, z])",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result == "0" || result == "0.0",
+        "div(curl(F)) should be 0, got: {}", result);
+}
+
+#[test]
+fn test_vec_used_in_cas_operation() {
+    // Build a vector with vec() and use it in divg
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "F = vec(x^2, y^2, z^2)",
+        "divg(F, [x, y, z])",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result.contains("2*x") && result.contains("2*y") && result.contains("2*z"),
+        "Expected 2*x + 2*y + 2*z, got: {}", result);
+}
+
+#[test]
+fn test_vec_used_in_curl() {
+    // Build a 2D vector with vec() and compute its curl
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "F = vec(y, -x)",
+        "curl(F, [x, y])",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result.contains("-2") || result.contains("- 2"),
+        "Expected z-component -2, got: {}", result);
+}
+
+#[test]
+fn test_grad_with_vec_vars() {
+    // Use vec() to construct the variable list
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "vars = vec(x, y, z)",
+        "grad(x^2 + y^2 + z^2, vars)",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[1]);
+    assert!(result.contains("2*x") && result.contains("2*y") && result.contains("2*z"),
+        "Expected [2*x, 2*y, 2*z], got: {}", result);
+}
+
+#[test]
+fn test_pdiff_on_cas_results() {
+    // Compute two definite integrals and compare them with pdiff
+    let mut evaluator = Evaluator::new();
+    let sympy_bridge = "backends/python_bridge.py";
+    evaluator.init_cas(Some(sympy_bridge), None);
+    assert!(evaluator.has_cas());
+
+    let inputs = &[
+        "a = int(x^2, x, 0, 1)",   // 1/3
+        "b = int(x^3, x, 0, 1)",   // 1/4
+        "pdiff(a, b)",
+    ];
+    let mut results = Vec::new();
+    for input in inputs {
+        let tokens = aurita::lang::lexer::Lexer::new(input).tokenize().unwrap();
+        let stmts = aurita::lang::parser::Parser::new(tokens).parse_program().unwrap();
+        results.push(evaluator.eval_program(&stmts).unwrap());
+    }
+    let result = format!("{}", results[2]);
+    // pdiff(1/3, 1/4) = |1/3 - 1/4| / ((1/3 + 1/4)/2) * 100
+    // = (1/12) / (7/24) * 100 = (24/84) * 100 ≈ 28.57%
+    // Just verify it's a reasonable positive number
+    let f: f64 = result.parse().expect(&format!("Expected a number, got: {}", result));
+    assert!(f > 20.0 && f < 40.0, "Expected pdiff ~28.57%, got: {}", f);
+}
+
+#[test]
+fn test_grad_polynomial_high_degree() {
+    // grad(x^5*y^3, [x, y]) = [5*x^4*y^3, 3*x^5*y^2]
+    let result = eval_str("grad(x^5*y^3, [x, y])");
+    assert!(result.contains("5") && result.contains("3"),
+        "Expected polynomial gradient, got: {}", result);
+}
+
+#[test]
+fn test_grad_with_trig_and_exp() {
+    // grad(sin(x)*exp(y), [x, y]) = [cos(x)*exp(y), sin(x)*exp(y)]
+    let result = eval_str("grad(sin(x)*exp(y), [x, y])");
+    assert!(result.contains("cos") && result.contains("exp"),
+        "Expected cos and exp in gradient, got: {}", result);
+}
+
+#[test]
+fn test_divg_solenoidal_field() {
+    // A solenoidal (divergence-free) field: F = [-y, x, 0]
+    // divg = d(-y)/dx + d(x)/dy + d(0)/dz = 0 + 0 + 0 = 0
+    let result = eval_str("divg([-y, x, 0], [x, y, z])");
+    assert!(result == "0" || result == "0.0",
+        "Divergence of solenoidal field should be 0, got: {}", result);
+}
+
+#[test]
+fn test_grad_returns_vector() {
+    // Verify grad returns a Vector value
+    let result = eval_with_cas("grad(x^2 + y^2, [x, y])").unwrap();
+    assert!(matches!(result, Value::Vector(_)),
+        "grad should return a Vector, got: {}", result);
+    if let Value::Vector(items) = result {
+        assert_eq!(items.len(), 2, "grad of 2-var expr should have 2 components");
+    }
+}
+
+#[test]
+fn test_curl_returns_vector() {
+    // Verify curl returns a Vector value
+    let result = eval_with_cas("curl([y, -x, 0], [x, y, z])").unwrap();
+    assert!(matches!(result, Value::Vector(_)),
+        "curl should return a Vector, got: {}", result);
+    if let Value::Vector(items) = result {
+        assert_eq!(items.len(), 3, "3D curl should have 3 components");
+    }
+}
+
+#[test]
+fn test_curl_2d_returns_3d_vector() {
+    // 2D curl should return a 3D vector [0, 0, scalar]
+    let result = eval_with_cas("curl([0, x^2], [x, y])").unwrap();
+    assert!(matches!(result, Value::Vector(_)),
+        "curl should return a Vector, got: {}", result);
+    if let Value::Vector(items) = result {
+        assert_eq!(items.len(), 3, "2D curl should return 3D vector, got {} components", items.len());
+        // First two components should be 0
+        assert_eq!(format!("{}", items[0]), "0");
+        assert_eq!(format!("{}", items[1]), "0");
+        // Third component = d(x^2)/dx - d(0)/dy = 2*x
+        let z_str = format!("{}", items[2]);
+        assert!(z_str.contains("2") && z_str.contains("x"),
+            "Expected 2*x as z-component, got: {}", z_str);
+    }
+}
+
+// =========================================================================
+// component() — complex decomposition
+// =========================================================================
+
+#[test]
+fn test_component_exp_i_pi_4() {
+    // component(exp(i*pi/4)) should give sqrt(2)/2 + sqrt(2)/2 * i
+    let result = eval_with_cas("component(exp(i*pi/4))").unwrap();
+    let s = format!("{}", result);
+    assert!(matches!(result, Value::Symbolic(_)),
+        "expected symbolic expression, got {:?}", result);
+    // Should contain both i and sqrt(2) (or 2^(1/2))
+    assert!(s.contains("i"), "expected imaginary part, got: {}", s);
+    assert!(s.contains("sqrt") || s.contains("2"),
+        "expected sqrt(2) in result, got: {}", s);
+}
+
+#[test]
+fn test_component_purely_real() {
+    // component(exp(0)) = 1 (purely real, no imaginary part)
+    let result = eval_with_cas("component(exp(0))").unwrap();
+    let s = format!("{}", result);
+    assert!(!s.contains("i"), "expected purely real result, got: {}", s);
+}
+
+#[test]
+fn test_component_purely_imaginary() {
+    // component(i) = i
+    let result = eval_with_cas("component(i)").unwrap();
+    let s = format!("{}", result);
+    assert!(s.contains("i"), "expected i, got: {}", s);
+}
+
+#[test]
+fn test_component_complex_sum() {
+    // component(1 + i) = 1 + i
+    let result = eval_with_cas("component(1 + i)").unwrap();
+    let s = format!("{}", result);
+    assert!(s.contains("1"), "expected real part 1, got: {}", s);
+    assert!(s.contains("i"), "expected imaginary part, got: {}", s);
+}
+
+#[test]
+fn test_component_cos_i_sin() {
+    // component(cos(pi/6) + i*sin(pi/6)) should give sqrt(3)/2 + i/2 (exact)
+    let result = eval_with_cas("component(cos(pi/6) + i*sin(pi/6))").unwrap();
+    let s = format!("{}", result);
+    assert!(s.contains("i"), "expected imaginary part, got: {}", s);
+    assert!(s.contains("sqrt") || s.contains("3"),
+        "expected sqrt(3) in result, got: {}", s);
 }

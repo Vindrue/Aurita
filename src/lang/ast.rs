@@ -13,7 +13,7 @@ pub enum Stmt {
         span: Span,
     },
 
-    /// Function definition: `f(x) = 3x` or `f(x, y) = x^2 + y^2`
+    /// Function definition: `f(x) = x^2 + 1` or `f(x, y) = x^2 + y^2`
     FuncDef {
         name: String,
         params: Vec<String>,

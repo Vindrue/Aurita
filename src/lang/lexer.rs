@@ -23,19 +23,6 @@ impl Lexer {
                 break;
             }
             let token = self.next_token()?;
-            // Insert implicit multiplication if applicable
-            if let Some(prev) = self.tokens.last() {
-                if prev.kind.can_end_implicit_mul() && token.kind.can_start_implicit_mul() {
-                    // Don't insert implicit mul before '(' if previous token is an identifier
-                    // (that's a function call, not multiplication)
-                    let is_func_call = matches!(&prev.kind, TokenKind::Ident(_))
-                        && matches!(&token.kind, TokenKind::LParen);
-                    if !is_func_call {
-                        let span = Span::new(prev.span.end, token.span.start);
-                        self.tokens.push(Token::new(TokenKind::Star, span));
-                    }
-                }
-            }
             self.tokens.push(token);
         }
         self.tokens
@@ -387,32 +374,6 @@ mod tests {
             lex("3 + 4"),
             vec![TokenKind::Integer(3), TokenKind::Plus, TokenKind::Integer(4)]
         );
-    }
-
-    #[test]
-    fn test_implicit_multiplication() {
-        // 3x -> 3 * x
-        assert_eq!(
-            lex("3x"),
-            vec![
-                TokenKind::Integer(3),
-                TokenKind::Star,
-                TokenKind::Ident("x".into()),
-            ]
-        );
-        // 2(x+1) -> 2 * (x + 1)
-        let tokens = lex("2(x+1)");
-        assert_eq!(tokens[0], TokenKind::Integer(2));
-        assert_eq!(tokens[1], TokenKind::Star);
-        assert_eq!(tokens[2], TokenKind::LParen);
-    }
-
-    #[test]
-    fn test_no_implicit_mul_for_func_call() {
-        // sin(x) should NOT insert * between sin and (
-        let tokens = lex("sin(x)");
-        assert_eq!(tokens[0], TokenKind::Ident("sin".into()));
-        assert_eq!(tokens[1], TokenKind::LParen);
     }
 
     #[test]

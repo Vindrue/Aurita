@@ -80,6 +80,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, picker: Option
     let sympy_bridge = locate_bridge("python_bridge");
     let maxima_bridge = locate_bridge("maxima_bridge");
 
+    app.sympy_bridge_path = sympy_bridge.clone();
+    app.maxima_bridge_path = maxima_bridge.clone();
+
     app.evaluator.init_cas(
         sympy_bridge.as_deref(),
         maxima_bridge.as_deref(),

@@ -110,9 +110,12 @@ def expr_from_json(node):
             "sinh": sinh, "cosh": cosh, "tanh": tanh,
             "exp": exp, "ln": log, "log": log, "sqrt": sqrt,
             "abs": Abs, "sign": sign, "floor": floor, "ceil": ceiling,
+            "conj": sympy.conjugate,
             "erf": sympy.erf, "erfc": sympy.erfc,
             "gamma": sympy.gamma, "factorial": sympy.factorial,
         }
+        if fname == "abs2":
+            return Abs(args[0])**2
         if fname in func_map:
             return func_map[fname](*args)
         else:
@@ -252,7 +255,8 @@ def expr_to_json(expr):
             "asin": "asin", "acos": "acos", "atan": "atan",
             "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
             "exp": "exp", "log": "ln",
-            "Abs": "abs", "sign": "sign", "floor": "floor", "ceiling": "ceil",
+            "Abs": "abs", "conjugate": "conj",
+            "sign": "sign", "floor": "floor", "ceiling": "ceil",
             "erf": "erf", "erfc": "erfc",
             "gamma": "gamma", "factorial": "factorial",
         }
@@ -466,6 +470,21 @@ def handle_request(req):
             expr = expr_from_json(params["expr"])
             result = latex(expr)
             return {"id": req_id, "status": "ok", "result": {"type": "Sym", "name": result}, "latex": result}
+
+        elif op_name == "component":
+            expr = expr_from_json(params["expr"])
+            # Expand into rectangular form: re + im*I
+            expanded = sympy.expand(expr, complex=True)
+            re_part = sympy.re(expanded)
+            im_part = sympy.im(expanded)
+            # Simplify the parts
+            re_part = sympy.simplify(re_part)
+            im_part = sympy.simplify(im_part)
+            return {
+                "id": req_id,
+                "status": "ok",
+                "results": [expr_to_json(re_part), expr_to_json(im_part)],
+            }
 
         elif op_name == "lambdify":
             expr = expr_from_json(params["expr"])

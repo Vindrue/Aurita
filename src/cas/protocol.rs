@@ -52,6 +52,8 @@ pub enum CasOp {
     },
     #[serde(rename = "latex")]
     Latex { expr: SymExpr },
+    #[serde(rename = "component")]
+    Component { expr: SymExpr },
     #[serde(rename = "lambdify")]
     Lambdify {
         expr: SymExpr,

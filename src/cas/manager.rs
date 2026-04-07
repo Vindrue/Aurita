@@ -192,6 +192,11 @@ impl CasManager {
         self.execute_op(op, ResponseKind::Single)
     }
 
+    pub fn component(&mut self, expr: &SymExpr) -> Result<CasResult, String> {
+        let op = CasOp::Component { expr: expr.clone() };
+        self.execute_op(op, ResponseKind::Multiple)
+    }
+
     pub fn latex(&mut self, expr: &SymExpr) -> Result<CasResult, String> {
         let op = CasOp::Latex { expr: expr.clone() };
         self.execute_op(op, ResponseKind::Latex)

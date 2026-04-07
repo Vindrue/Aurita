@@ -8,7 +8,7 @@ use crate::lang::token::Span;
 use crate::lang::types::*;
 use crate::plot::render::render_plot;
 use crate::plot::types::*;
-use crate::symbolic::expr::{SymExpr, SymOp};
+use crate::symbolic::expr::{MathConst, SymExpr, SymOp};
 
 /// Signals for control flow (break, continue, return).
 #[derive(Debug)]
@@ -34,6 +34,10 @@ pub struct Evaluator {
     pub cas_manager: Option<CasManager>,
     /// Output display mode (simple ASCII vs pretty Unicode).
     pub output_mode: OutputMode,
+    /// Whether to auto-simplify symbolic results via CAS.
+    pub auto_simplify: bool,
+    /// Whether to reduce base SI units to derived names (Pa, N, J, etc.) in display.
+    pub reduce_units: bool,
 }
 
 impl Evaluator {
@@ -45,6 +49,8 @@ impl Evaluator {
             output: Vec::new(),
             cas_manager: None,
             output_mode: OutputMode::Simple,
+            auto_simplify: false,
+            reduce_units: true,
         }
     }
 
@@ -98,6 +104,8 @@ impl Evaluator {
                 Err(e) => return Err(e),
             }
         }
+        // Auto-simplify symbolic results if enabled
+        last = self.maybe_auto_simplify(last);
         Ok(last)
     }
 
@@ -500,8 +508,13 @@ impl Evaluator {
         }
 
         // Quantity arithmetic: if either side is a Quantity, dispatch to quantity ops
+        // But if the other side is symbolic, promote the quantity to symbolic instead
         if matches!(left, Value::Quantity(_)) || matches!(right, Value::Quantity(_)) {
-            return self.eval_quantity_binop(op, left, right, span);
+            let other_is_symbolic = left.is_symbolic() || right.is_symbolic();
+            if !other_is_symbolic {
+                return self.eval_quantity_binop(op, left, right, span);
+            }
+            // Fall through to symbolic path — quantity will be converted via to_sym_expr
         }
 
         // If either side is symbolic, promote to symbolic
@@ -515,6 +528,17 @@ impl Evaluator {
                     LangError::type_err(format!("cannot use {} in symbolic expression", right.type_name()))
                         .with_span(span)
                 })?;
+
+                // Simplify i^n for integer powers of the imaginary unit
+                if sym_op == SymOp::Pow {
+                    if let SymExpr::Const { name: MathConst::I } = &lhs {
+                        if let Some(n) = rhs.as_int() {
+                            return Ok(simplify_i_pow(n));
+                        }
+                    }
+                }
+
+                // Simplify multiplication by i results (e.g., x * i^2 patterns)
                 return Ok(Value::Symbolic(SymExpr::BinOp {
                     op: sym_op,
                     lhs: Box::new(lhs),
@@ -739,6 +763,11 @@ impl Evaluator {
             "using" => Ok(Some(self.eval_using(args, span)?)),
             "to" => Ok(Some(self.eval_unit_convert(args, span)?)),
             "output" => Ok(Some(self.set_output_mode(args, span)?)),
+            "reduceunits" => Ok(Some(self.set_reduce_units(args, span)?)),
+            "component" => Ok(Some(self.eval_component(args, span)?)),
+            "grad" => Ok(Some(self.cas_gradient(args, span)?)),
+            "divg" => Ok(Some(self.cas_divergence(args, span)?)),
+            "curl" => Ok(Some(self.cas_curl(args, span)?)),
             _ => Ok(None),
         }
     }
@@ -830,6 +859,226 @@ impl Evaluator {
                 Ok(Value::Str("Output mode: pretty".to_string()))
             }
             _ => Err(LangError::eval(format!("output: unknown mode \"{}\", expected \"simple\" or \"pretty\"", name)).with_span(span)),
+        }
+    }
+
+    fn set_reduce_units(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        if args.len() != 1 {
+            return Err(LangError::arity("reduceunits: expected 1 argument: reduceunits(true|false)").with_span(span));
+        }
+        let val = self.eval_expr(&args[0])?;
+        match val {
+            Value::Bool(b) => {
+                self.reduce_units = b;
+                Ok(Value::Str(format!("Reduce units: {}", if b { "on" } else { "off" })))
+            }
+            _ => Err(LangError::type_err("reduceunits: argument must be true or false").with_span(span)),
+        }
+    }
+
+    /// Extract a vector of symbolic variable names from a Value::Vector of symbolic vars.
+    fn extract_sym_vars(&self, val: &Value, op_name: &str, span: Span) -> LangResult<Vec<String>> {
+        match val {
+            Value::Vector(items) => {
+                let mut vars = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Symbolic(SymExpr::Sym { name }) => vars.push(name.clone()),
+                        _ => return Err(LangError::type_err(format!(
+                            "{}: variable vector must contain symbolic variables, got {}", op_name, item.type_name()
+                        )).with_span(span)),
+                    }
+                }
+                Ok(vars)
+            }
+            _ => Err(LangError::type_err(format!(
+                "{}: second argument must be a vector of variables", op_name
+            )).with_span(span)),
+        }
+    }
+
+    /// Extract a vector of SymExprs from a Value::Vector.
+    fn extract_sym_vector(&self, val: &Value, op_name: &str, span: Span) -> LangResult<Vec<SymExpr>> {
+        match val {
+            Value::Vector(items) => {
+                let mut exprs = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.to_sym_expr() {
+                        Some(e) => exprs.push(e),
+                        None => return Err(LangError::type_err(format!(
+                            "{}: field components must be numeric or symbolic, got {}", op_name, item.type_name()
+                        )).with_span(span)),
+                    }
+                }
+                Ok(exprs)
+            }
+            _ => Err(LangError::type_err(format!(
+                "{}: first argument must be a vector field", op_name
+            )).with_span(span)),
+        }
+    }
+
+    /// grad(expr, [x, y, z]) — gradient of scalar expression
+    fn cas_gradient(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("grad", span)?;
+        if args.len() != 2 {
+            return Err(LangError::arity("grad: expected 2 arguments: grad(expr, [vars])").with_span(span));
+        }
+
+        let expr_val = self.eval_expr(&args[0])?;
+        let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
+            LangError::type_err("grad: first argument must be a numeric or symbolic expression").with_span(span)
+        })?;
+
+        let vars_val = self.eval_expr(&args[1])?;
+        let vars = self.extract_sym_vars(&vars_val, "grad", span)?;
+
+        if vars.is_empty() {
+            return Err(LangError::eval("grad: variable vector must not be empty").with_span(span));
+        }
+
+        let mut components = Vec::with_capacity(vars.len());
+        for var in &vars {
+            let result = self.cas_manager.as_mut().unwrap()
+                .differentiate(&sym_expr, var, 1)
+                .map_err(|e| LangError::eval(format!("grad: {}", e)).with_span(span))?;
+            components.push(self.cas_result_to_value(result));
+        }
+
+        Ok(Value::Vector(components))
+    }
+
+    /// divg([Fx, Fy, Fz], [x, y, z]) — divergence of vector field
+    fn cas_divergence(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("divg", span)?;
+        if args.len() != 2 {
+            return Err(LangError::arity("divg: expected 2 arguments: divg([field], [vars])").with_span(span));
+        }
+
+        let field_val = self.eval_expr(&args[0])?;
+        let field = self.extract_sym_vector(&field_val, "divg", span)?;
+
+        let vars_val = self.eval_expr(&args[1])?;
+        let vars = self.extract_sym_vars(&vars_val, "divg", span)?;
+
+        if field.len() != vars.len() {
+            return Err(LangError::eval(format!(
+                "divg: field has {} components but {} variables given", field.len(), vars.len()
+            )).with_span(span));
+        }
+
+        // Divergence = sum of dF_i/dx_i
+        let mut terms: Vec<SymExpr> = Vec::new();
+        for (component, var) in field.iter().zip(vars.iter()) {
+            let result = self.cas_manager.as_mut().unwrap()
+                .differentiate(component, var, 1)
+                .map_err(|e| LangError::eval(format!("divg: {}", e)).with_span(span))?;
+            match result {
+                crate::cas::manager::CasResult::Single(expr) |
+                crate::cas::manager::CasResult::Agreed(expr) => terms.push(expr),
+                _ => return Err(LangError::eval("divg: unexpected CAS result").with_span(span)),
+            }
+        }
+
+        // Sum all terms
+        if terms.is_empty() {
+            return Ok(Value::Number(Number::Int(0)));
+        }
+        let mut sum = terms.remove(0);
+        for term in terms {
+            sum = SymExpr::BinOp {
+                op: SymOp::Add,
+                lhs: Box::new(sum),
+                rhs: Box::new(term),
+            };
+        }
+
+        // Try to simplify the sum via CAS
+        match self.cas_manager.as_mut().unwrap().simplify(&sum) {
+            Ok(result) => Ok(self.cas_result_to_value(result)),
+            Err(_) => Ok(Value::Symbolic(sum)),
+        }
+    }
+
+    /// Differentiate a symbolic expression via CAS, returning just the SymExpr.
+    fn cas_diff_sym(&mut self, expr: &SymExpr, var: &str, op_name: &str, span: Span) -> LangResult<SymExpr> {
+        let result = self.cas_manager.as_mut().unwrap()
+            .differentiate(expr, var, 1)
+            .map_err(|e| LangError::eval(format!("{}: {}", op_name, e)).with_span(span))?;
+        match result {
+            crate::cas::manager::CasResult::Single(e) |
+            crate::cas::manager::CasResult::Agreed(e) => Ok(e),
+            _ => Err(LangError::eval(format!("{}: unexpected CAS result", op_name)).with_span(span)),
+        }
+    }
+
+    /// Try to simplify a SymExpr via CAS; return it unchanged on failure.
+    fn simplify_or_keep(&mut self, expr: SymExpr) -> Value {
+        match self.cas_manager.as_mut().unwrap().simplify(&expr) {
+            Ok(crate::cas::manager::CasResult::Single(e)) |
+            Ok(crate::cas::manager::CasResult::Agreed(e)) => Value::Symbolic(e),
+            _ => Value::Symbolic(expr),
+        }
+    }
+
+    /// curl([Fx, Fy, Fz], [x, y, z]) — curl of vector field (3D)
+    /// curl([Fx, Fy], [x, y]) — curl of 2D field, returns 3D vector [0, 0, dFy/dx - dFx/dy]
+    fn cas_curl(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("curl", span)?;
+        if args.len() != 2 {
+            return Err(LangError::arity("curl: expected 2 arguments: curl([field], [vars])").with_span(span));
+        }
+
+        let field_val = self.eval_expr(&args[0])?;
+        let field = self.extract_sym_vector(&field_val, "curl", span)?;
+
+        let vars_val = self.eval_expr(&args[1])?;
+        let vars = self.extract_sym_vars(&vars_val, "curl", span)?;
+
+        if field.len() != vars.len() {
+            return Err(LangError::eval(format!(
+                "curl: field has {} components but {} variables given", field.len(), vars.len()
+            )).with_span(span));
+        }
+
+        match field.len() {
+            2 => {
+                // 2D: curl = [0, 0, dFy/dx - dFx/dy]
+                let dfy_dx = self.cas_diff_sym(&field[1], &vars[0], "curl", span)?;
+                let dfx_dy = self.cas_diff_sym(&field[0], &vars[1], "curl", span)?;
+                let z_component = SymExpr::BinOp {
+                    op: SymOp::Sub,
+                    lhs: Box::new(dfy_dx),
+                    rhs: Box::new(dfx_dy),
+                };
+                let z_val = self.simplify_or_keep(z_component);
+                Ok(Value::Vector(vec![
+                    Value::Number(Number::Int(0)),
+                    Value::Number(Number::Int(0)),
+                    z_val,
+                ]))
+            }
+            3 => {
+                // 3D: curl = [dFz/dy - dFy/dz, dFx/dz - dFz/dx, dFy/dx - dFx/dy]
+                let dfz_dy = self.cas_diff_sym(&field[2], &vars[1], "curl", span)?;
+                let dfy_dz = self.cas_diff_sym(&field[1], &vars[2], "curl", span)?;
+                let dfx_dz = self.cas_diff_sym(&field[0], &vars[2], "curl", span)?;
+                let dfz_dx = self.cas_diff_sym(&field[2], &vars[0], "curl", span)?;
+                let dfy_dx = self.cas_diff_sym(&field[1], &vars[0], "curl", span)?;
+                let dfx_dy = self.cas_diff_sym(&field[0], &vars[1], "curl", span)?;
+
+                let c1 = SymExpr::BinOp { op: SymOp::Sub, lhs: Box::new(dfz_dy), rhs: Box::new(dfy_dz) };
+                let c2 = SymExpr::BinOp { op: SymOp::Sub, lhs: Box::new(dfx_dz), rhs: Box::new(dfz_dx) };
+                let c3 = SymExpr::BinOp { op: SymOp::Sub, lhs: Box::new(dfy_dx), rhs: Box::new(dfx_dy) };
+
+                let v1 = self.simplify_or_keep(c1);
+                let v2 = self.simplify_or_keep(c2);
+                let v3 = self.simplify_or_keep(c3);
+                Ok(Value::Vector(vec![v1, v2, v3]))
+            }
+            n => Err(LangError::eval(format!(
+                "curl: expected 2D or 3D field, got {} components", n
+            )).with_span(span)),
         }
     }
 
@@ -1078,18 +1327,44 @@ impl Evaluator {
     }
 
     fn cas_simplify(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
-        self.require_cas("simplify", span)?;
         if args.len() != 1 {
-            return Err(LangError::arity("simplify: expected 1 argument").with_span(span));
+            return Err(LangError::arity("simplify: expected 1 argument (expression or true/false)").with_span(span));
         }
-        let expr_val = self.eval_expr(&args[0])?;
-        let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
+        // Check for toggle: simplify(true) / simplify(false)
+        let val = self.eval_expr(&args[0])?;
+        if let Value::Bool(b) = val {
+            self.auto_simplify = b;
+            return Ok(Value::Str(format!("Auto-simplify: {}", if b { "on" } else { "off" })));
+        }
+        // Normal simplify(expr) — requires CAS
+        self.require_cas("simplify", span)?;
+        let sym_expr = val.to_sym_expr().ok_or_else(|| {
             LangError::type_err("simplify: argument must be symbolic").with_span(span)
         })?;
         let manager = self.cas_manager.as_mut().unwrap();
         let result = manager.simplify(&sym_expr)
             .map_err(|e| LangError::eval(format!("simplify: {}", e)).with_span(span))?;
         Ok(self.cas_result_to_value(result))
+    }
+
+    /// Run CAS simplify on a value if auto_simplify is on and CAS is available.
+    pub fn maybe_auto_simplify(&mut self, val: Value) -> Value {
+        if !self.auto_simplify {
+            return val;
+        }
+        if let Some(sym_expr) = val.to_sym_expr() {
+            // Only simplify if there are free symbols (skip plain numbers)
+            if sym_expr.free_symbols().is_empty() && !matches!(&val, Value::Symbolic(_)) {
+                return val;
+            }
+            if let Some(ref mut manager) = self.cas_manager {
+                match manager.simplify(&sym_expr) {
+                    Ok(result) => return self.cas_result_to_value(result),
+                    Err(_) => return val,
+                }
+            }
+        }
+        val
     }
 
     fn cas_expand(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -1120,6 +1395,123 @@ impl Evaluator {
         let result = manager.factor(&sym_expr)
             .map_err(|e| LangError::eval(format!("factor: {}", e)).with_span(span))?;
         Ok(self.cas_result_to_value(result))
+    }
+
+    /// Decompose into components: complex → a + b*i (exact, via CAS), vector → string with e_n.
+    fn eval_component(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        if args.len() != 1 {
+            return Err(LangError::arity("component: expected 1 argument").with_span(span));
+        }
+        let val = self.eval_expr(&args[0])?;
+
+        match &val {
+            Value::Vector(elements) => {
+                // Format as string: a*e_1 + b*e_2 + ...
+                let mut parts = Vec::new();
+                for (i, elem) in elements.iter().enumerate() {
+                    let label = format!("e_{}", i + 1);
+                    let s = format!("{}", elem);
+                    if s == "0" || s == "0.0" {
+                        continue;
+                    }
+                    if s == "1" || s == "1.0" {
+                        parts.push(label);
+                    } else if s == "-1" || s == "-1.0" {
+                        parts.push(format!("-{}", label));
+                    } else {
+                        // Wrap in parens if the element contains + or - (except leading -)
+                        let needs_parens = s.chars().skip(1).any(|c| c == '+' || c == '-');
+                        if needs_parens {
+                            parts.push(format!("({})*{}", s, label));
+                        } else {
+                            parts.push(format!("{}*{}", s, label));
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    Ok(Value::Str("0".to_string()))
+                } else {
+                    // Join with " + " but handle leading negatives
+                    let mut result = parts[0].clone();
+                    for part in &parts[1..] {
+                        if part.starts_with('-') {
+                            result.push_str(&format!(" - {}", &part[1..]));
+                        } else {
+                            result.push_str(&format!(" + {}", part));
+                        }
+                    }
+                    Ok(Value::Str(result))
+                }
+            }
+            Value::Symbolic(_) | Value::Number(_) => {
+                // Complex decomposition via CAS
+                self.require_cas("component", span)?;
+                let sym_expr = val.to_sym_expr().ok_or_else(|| {
+                    LangError::type_err("component: argument must be symbolic or numeric")
+                        .with_span(span)
+                })?;
+                let manager = self.cas_manager.as_mut().unwrap();
+                let result = manager.component(&sym_expr)
+                    .map_err(|e| LangError::eval(format!("component: {}", e)).with_span(span))?;
+
+                // Result is Multiple([re_part, im_part])
+                match result {
+                    CasResult::Multiple(parts) | CasResult::AgreedMultiple(parts) => {
+                        if parts.len() != 2 {
+                            return Err(LangError::eval(
+                                "component: unexpected result from CAS backend"
+                            ).with_span(span));
+                        }
+                        let re_expr = parts[0].clone();
+                        let im_expr = parts[1].clone();
+
+                        let is_sym_zero = |e: &SymExpr| -> bool {
+                            matches!(e, SymExpr::Int { value: 0 })
+                                || matches!(e, SymExpr::Float { value } if *value == 0.0)
+                        };
+
+                        if is_sym_zero(&im_expr) {
+                            // Purely real
+                            Ok(Value::Symbolic(re_expr))
+                        } else {
+                            // Build im*i term
+                            let i_const = SymExpr::Const {
+                                name: crate::symbolic::expr::MathConst::I,
+                            };
+                            let im_term = match &im_expr {
+                                SymExpr::Int { value: 1 } => i_const.clone(),
+                                SymExpr::Int { value: -1 } => {
+                                    SymExpr::Neg { expr: Box::new(i_const.clone()) }
+                                }
+                                _ => SymExpr::BinOp {
+                                    op: SymOp::Mul,
+                                    lhs: Box::new(im_expr),
+                                    rhs: Box::new(i_const),
+                                },
+                            };
+
+                            if is_sym_zero(&re_expr) {
+                                Ok(Value::Symbolic(im_term))
+                            } else {
+                                Ok(Value::Symbolic(SymExpr::BinOp {
+                                    op: SymOp::Add,
+                                    lhs: Box::new(re_expr),
+                                    rhs: Box::new(im_term),
+                                }))
+                            }
+                        }
+                    }
+                    _ => {
+                        // Fallback: just return what we got
+                        Ok(self.cas_result_to_value(result))
+                    }
+                }
+            }
+            _ => Err(LangError::type_err(format!(
+                "component: expected vector or symbolic expression, got {}",
+                val.type_name()
+            )).with_span(span)),
+        }
     }
 
     fn cas_limit(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
@@ -1507,7 +1899,7 @@ impl Evaluator {
                 }
 
                 // If any argument is symbolic, try numeric eval first (for constants),
-                // otherwise build a symbolic function call
+                // otherwise build a symbolic function call (for math functions only)
                 if args.iter().any(|a| a.is_symbolic()) {
                     // Try to evaluate all args numerically (works for pi, e, 2*pi, etc.)
                     let numeric_args: Option<Vec<Value>> = args
@@ -1528,10 +1920,13 @@ impl Evaluator {
                         return Ok(result);
                     }
 
-                    // Has free variables — build symbolic function call
-                    let sym_args: Option<Vec<SymExpr>> = args.iter().map(|a| a.to_sym_expr()).collect();
-                    if let Some(sym_args) = sym_args {
-                        return Ok(Value::Symbolic(SymExpr::func(name, sym_args)));
+                    // Only lift pure math functions to symbolic — others (eval, typeof,
+                    // len, print, etc.) should always call the actual builtin
+                    if is_symbolic_math_func(name) {
+                        let sym_args: Option<Vec<SymExpr>> = args.iter().map(|a| a.to_sym_expr()).collect();
+                        if let Some(sym_args) = sym_args {
+                            return Ok(Value::Symbolic(SymExpr::func(name, sym_args)));
+                        }
                     }
                 }
 
@@ -1626,6 +2021,36 @@ impl Evaluator {
 }
 
 /// Map Aurita BinOpKind to symbolic SymOp (only for arithmetic ops).
+/// Functions that should be lifted to symbolic expressions when called with
+/// symbolic arguments (i.e. math functions that the CAS can evaluate).
+/// Everything else (eval, typeof, len, print, pm, uncertainty, nominal, units, etc.)
+/// falls through to the actual builtin implementation.
+fn is_symbolic_math_func(name: &str) -> bool {
+    matches!(
+        name,
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "sinh" | "cosh" | "tanh"
+        | "exp" | "ln" | "log" | "sqrt"
+        | "abs" | "abs2" | "conj"
+        | "sign" | "floor" | "ceil" | "round"
+    )
+}
+
+/// Simplify i^n where n is an integer.
+/// i^0 = 1, i^1 = i, i^2 = -1, i^3 = -i, then repeats (mod 4).
+fn simplify_i_pow(n: i64) -> Value {
+    let r = ((n % 4) + 4) % 4; // handle negative exponents
+    match r {
+        0 => Value::Number(Number::Int(1)),
+        1 => Value::Symbolic(SymExpr::Const { name: MathConst::I }),
+        2 => Value::Number(Number::Int(-1)),
+        3 => Value::Symbolic(SymExpr::Neg {
+            expr: Box::new(SymExpr::Const { name: MathConst::I }),
+        }),
+        _ => unreachable!(),
+    }
+}
+
 fn binop_to_symop(op: BinOpKind) -> Option<SymOp> {
     match op {
         BinOpKind::Add => Some(SymOp::Add),
@@ -1748,13 +2173,6 @@ mod tests {
         assert!(matches!(symbolic, Value::Symbolic(_)));
         // Then call numerically
         assert_eq!(eval_with(&mut e, "g(3)"), Value::Number(Number::Int(10)));
-    }
-
-    #[test]
-    fn test_implicit_mul() {
-        let mut e = Evaluator::new();
-        eval_with(&mut e, "x = 3");
-        assert_eq!(eval_with(&mut e, "2x"), Value::Number(Number::Int(6)));
     }
 
     #[test]
@@ -1887,7 +2305,7 @@ mod tests {
 
     #[test]
     fn test_symbolic_mul() {
-        let v = eval("3x");
+        let v = eval("3*x");
         assert!(matches!(v, Value::Symbolic(_)));
         assert_eq!(format!("{}", v), "3*x");
     }
@@ -1902,7 +2320,7 @@ mod tests {
 
     #[test]
     fn test_symbolic_complex_expr() {
-        let v = eval("3x^2 + 2x + 1");
+        let v = eval("3*x^2 + 2*x + 1");
         assert!(matches!(v, Value::Symbolic(_)));
     }
 
@@ -2346,6 +2764,629 @@ mod tests {
             assert!((q.uncertainty - 0.1).abs() < 1e-10);
         } else {
             panic!("expected Quantity, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_abs2_int() {
+        assert_eq!(eval("abs2(-3)"), Value::Number(Number::Int(9)));
+        assert_eq!(eval("abs2(5)"), Value::Number(Number::Int(25)));
+    }
+
+    #[test]
+    fn test_abs2_float() {
+        if let Value::Number(Number::Float(f)) = eval("abs2(-2.5)") {
+            assert!((f - 6.25).abs() < 1e-10);
+        } else {
+            panic!("expected float");
+        }
+    }
+
+    #[test]
+    fn test_abs2_symbolic() {
+        let v = eval("abs2(x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        if let Value::Symbolic(expr) = v {
+            assert_eq!(format!("{}", expr), "abs2(x)");
+        }
+    }
+
+    #[test]
+    fn test_conj_real() {
+        assert_eq!(eval("conj(5)"), Value::Number(Number::Int(5)));
+        assert_eq!(eval("conj(-3)"), Value::Number(Number::Int(-3)));
+    }
+
+    #[test]
+    fn test_conj_float() {
+        if let Value::Number(Number::Float(f)) = eval("conj(2.5)") {
+            assert!((f - 2.5).abs() < 1e-10);
+        } else {
+            panic!("expected float");
+        }
+    }
+
+    #[test]
+    fn test_conj_symbolic() {
+        let v = eval("conj(x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        if let Value::Symbolic(expr) = v {
+            assert_eq!(format!("{}", expr), "conj(x)");
+        }
+    }
+
+    #[test]
+    fn test_abs_pipe_squared() {
+        // |x|^2 should parse and work for numeric values
+        assert_eq!(eval("|-3|^2"), Value::Number(Number::Int(9)));
+    }
+
+    #[test]
+    fn test_i_squared() {
+        assert_eq!(eval("i^2"), Value::Number(Number::Int(-1)));
+    }
+
+    #[test]
+    fn test_i_powers() {
+        assert_eq!(eval("i^0"), Value::Number(Number::Int(1)));
+        assert!(matches!(eval("i^1"), Value::Symbolic(SymExpr::Const { name: MathConst::I })));
+        assert_eq!(eval("i^2"), Value::Number(Number::Int(-1)));
+        assert!(matches!(eval("i^3"), Value::Symbolic(SymExpr::Neg { .. })));
+        assert_eq!(eval("i^4"), Value::Number(Number::Int(1)));
+    }
+
+    #[test]
+    fn test_pdiff_basic() {
+        // pdiff(10, 12) = |10 - 12| / ((10+12)/2) * 100 = 2/11 * 100 ≈ 18.18...
+        let v = eval("pdiff(10, 12)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!((f - 200.0 / 11.0).abs() < 1e-10);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_same_values() {
+        let v = eval("pdiff(5, 5)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert_eq!(f, 0.0);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_reduceunits_toggle() {
+        let mut e = Evaluator::new();
+        assert!(e.reduce_units);  // on by default
+        let v = eval_with(&mut e, "reduceunits(false)");
+        assert!(!e.reduce_units);
+        if let Value::Str(s) = v {
+            assert!(s.contains("off"));
+        }
+        let v = eval_with(&mut e, "reduceunits(true)");
+        assert!(e.reduce_units);
+        if let Value::Str(s) = v {
+            assert!(s.contains("on"));
+        }
+    }
+
+    // =========================================================================
+    // vec() builtin tests
+    // =========================================================================
+
+    #[test]
+    fn test_vec_basic() {
+        let v = eval("vec(1, 2, 3)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0], Value::Number(Number::Int(1)));
+            assert_eq!(items[1], Value::Number(Number::Int(2)));
+            assert_eq!(items[2], Value::Number(Number::Int(3)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_single_element() {
+        let v = eval("vec(5)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0], Value::Number(Number::Int(5)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_zero_args_error() {
+        let tokens = Lexer::new("vec()").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err(), "vec() with zero arguments should error");
+    }
+
+    #[test]
+    fn test_vec_mixed_types() {
+        let v = eval("vec(1, 2.5, 3)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0], Value::Number(Number::Int(1)));
+            assert_eq!(items[1], Value::Number(Number::Float(2.5)));
+            assert_eq!(items[2], Value::Number(Number::Int(3)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_with_symbolic() {
+        let v = eval("vec(x, y, z)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], Value::Symbolic(_)));
+            assert!(matches!(items[1], Value::Symbolic(_)));
+            assert!(matches!(items[2], Value::Symbolic(_)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_with_expressions() {
+        let v = eval("vec(1 + 2, 3 * 4, 5 ^ 2)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items[0], Value::Number(Number::Int(3)));
+            assert_eq!(items[1], Value::Number(Number::Int(12)));
+            assert_eq!(items[2], Value::Number(Number::Int(25)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_single_element_arithmetic() {
+        // vec(5) should behave like [5] in arithmetic
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "v = vec(5)");
+        let v = eval_with(&mut e, "v + [10]");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0], Value::Number(Number::Int(15)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_scalar_mul() {
+        let v = eval("3 * vec(1, 2, 3)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items[0], Value::Number(Number::Int(3)));
+            assert_eq!(items[1], Value::Number(Number::Int(6)));
+            assert_eq!(items[2], Value::Number(Number::Int(9)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_add_vec() {
+        let v = eval("vec(1, 2) + vec(3, 4)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items[0], Value::Number(Number::Int(4)));
+            assert_eq!(items[1], Value::Number(Number::Int(6)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_indexing() {
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "v = vec(10, 20, 30)");
+        assert_eq!(eval_with(&mut e, "v[1]"), Value::Number(Number::Int(10)));
+        assert_eq!(eval_with(&mut e, "v[3]"), Value::Number(Number::Int(30)));
+    }
+
+    #[test]
+    fn test_vec_nested() {
+        // vec containing vectors (nested)
+        let v = eval("vec([1, 2], [3, 4])");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], Value::Vector(_)));
+            assert!(matches!(items[1], Value::Vector(_)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_with_quantities() {
+        let v = eval("vec(3[m], 4[m])");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], Value::Quantity(_)));
+            assert!(matches!(items[1], Value::Quantity(_)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_large() {
+        // Many arguments
+        let v = eval("vec(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)");
+        if let Value::Vector(items) = v {
+            assert_eq!(items.len(), 10);
+            assert_eq!(items[9], Value::Number(Number::Int(10)));
+        } else {
+            panic!("expected Vector, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_vec_len() {
+        let v = eval("len(vec(1, 2, 3))");
+        assert_eq!(v, Value::Number(Number::Int(3)));
+    }
+
+    #[test]
+    fn test_vec_typeof() {
+        let v = eval("typeof(vec(1, 2))");
+        assert_eq!(v, Value::Str("vector".to_string()));
+    }
+
+    // =========================================================================
+    // pdiff() adversarial tests
+    // =========================================================================
+
+    #[test]
+    fn test_pdiff_negative_values() {
+        // pdiff(-10, -12): |(-10) - (-12)| / |(-10 + -12)/2| * 100
+        // = |2| / |(-22)/2| * 100 = 2/11 * 100
+        let v = eval("pdiff(-10, -12)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!((f - 200.0 / 11.0).abs() < 1e-10,
+                "pdiff(-10, -12) should be ~18.18, got {}", f);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_mixed_sign() {
+        // pdiff(-5, 5): |(-5) - 5| / |(-5+5)/2| => avg is 0 => error
+        let tokens = Lexer::new("pdiff(-5, 5)").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err(), "pdiff with values summing to zero should error");
+    }
+
+    #[test]
+    fn test_pdiff_near_zero_sum() {
+        // pdiff(0.0001, -0.0001): sum is 0, should error
+        let tokens = Lexer::new("pdiff(0.0001, -0.0001)").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err(), "pdiff with values summing to zero should error");
+    }
+
+    #[test]
+    fn test_pdiff_very_large_values() {
+        // pdiff(1e15, 1e15) = 0
+        let v = eval("pdiff(1000000000000000, 1000000000000000)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert_eq!(f, 0.0);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_very_small_difference() {
+        // pdiff(1.0000001, 1.0) — tiny difference
+        let v = eval("pdiff(1.0000001, 1.0)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!(f > 0.0 && f < 0.01,
+                "Very small pdiff should be near 0, got {}", f);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_floats() {
+        // pdiff(3.14, 3.15)
+        let v = eval("pdiff(3.14, 3.15)");
+        if let Value::Number(Number::Float(f)) = v {
+            let expected = (0.01 / ((3.14 + 3.15) / 2.0)) * 100.0;
+            assert!((f - expected).abs() < 1e-10,
+                "expected {}, got {}", expected, f);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_commutative() {
+        // pdiff(a, b) should equal pdiff(b, a)
+        let v1 = eval("pdiff(10, 15)");
+        let v2 = eval("pdiff(15, 10)");
+        let f1 = if let Value::Number(Number::Float(f)) = v1 { f } else { panic!("expected float") };
+        let f2 = if let Value::Number(Number::Float(f)) = v2 { f } else { panic!("expected float") };
+        assert!((f1 - f2).abs() < 1e-10, "pdiff should be commutative: {} vs {}", f1, f2);
+    }
+
+    #[test]
+    fn test_pdiff_one_zero() {
+        // pdiff(0, 10): avg = 5, |0-10|/5 * 100 = 200
+        let v = eval("pdiff(0, 10)");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!((f - 200.0).abs() < 1e-10, "expected 200, got {}", f);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_pdiff_both_zero() {
+        // pdiff(0, 0): avg = 0 => error
+        let tokens = Lexer::new("pdiff(0, 0)").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse_program().unwrap();
+        let mut evaluator = Evaluator::new();
+        let result = evaluator.eval_program(&stmts);
+        assert!(result.is_err(), "pdiff(0, 0) should error (division by zero)");
+    }
+
+    #[test]
+    fn test_pdiff_with_computed_values() {
+        // Use pdiff with expressions, not just literals
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "a = 2^10");
+        eval_with(&mut e, "b = 1000");
+        let v = eval_with(&mut e, "pdiff(a, b)");
+        if let Value::Number(Number::Float(f)) = v {
+            // pdiff(1024, 1000) = |24| / 1012 * 100
+            let expected = (24.0 / 1012.0) * 100.0;
+            assert!((f - expected).abs() < 1e-10, "expected {}, got {}", expected, f);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    // =========================================================================
+    // Undefined variable/function detection (eval level)
+    // =========================================================================
+
+    #[test]
+    fn test_unknown_ident_becomes_symbolic() {
+        // Unknown identifiers produce SymExpr::Sym — this is expected for CAS
+        let v = eval("foobar");
+        assert!(matches!(v, Value::Symbolic(SymExpr::Sym { .. })),
+            "Unknown ident should be symbolic, got {:?}", v);
+    }
+
+    #[test]
+    fn test_unknown_in_expression_stays_symbolic() {
+        let v = eval("unknown_var + 1");
+        assert!(matches!(v, Value::Symbolic(_)),
+            "Expression with unknown ident should be symbolic, got {:?}", v);
+    }
+
+    #[test]
+    fn test_multiple_unknowns_symbolic() {
+        let v = eval("alpha * beta + gamma");
+        assert!(matches!(v, Value::Symbolic(_)),
+            "Expression with multiple unknowns should be symbolic, got {:?}", v);
+    }
+
+    #[test]
+    fn test_unknown_function_call_symbolic() {
+        // Calling an undefined name as a function on symbolic args
+        let v = eval("sin(undefined_x)");
+        assert!(matches!(v, Value::Symbolic(_)),
+            "sin(undefined) should be symbolic, got {:?}", v);
+    }
+
+    #[test]
+    fn test_known_var_not_symbolic() {
+        // Defined variables should NOT be symbolic
+        let mut e = Evaluator::new();
+        eval_with(&mut e, "myvar = 42");
+        let v = eval_with(&mut e, "myvar");
+        assert_eq!(v, Value::Number(Number::Int(42)));
+        assert!(!matches!(v, Value::Symbolic(_)));
+    }
+
+    // --- Complex evaluation tests ---
+
+    #[test]
+    fn test_eval_i_squared() {
+        // eval(i^2) should give -1
+        let v = eval("eval(i^2)");
+        assert_eq!(v, Value::Number(Number::Int(-1)));
+    }
+
+    #[test]
+    fn test_eval_i_cubed() {
+        // eval(i^3) = -i (already simplified by i^n path, but eval should also work)
+        let v = eval("eval(i^3)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("i"), "expected -i, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_complex_expr() {
+        // eval(1 + 2*i) should return a complex symbolic result
+        let v = eval("eval(1 + 2*i)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("i"), "expected complex result, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_i_plus_i() {
+        // eval(i + i) = 2i
+        let v = eval("eval(i + i)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("i"), "expected 2i, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_complex_magnitude() {
+        // abs(3 + 4i) = 5
+        let v = eval("eval(abs(3 + 4*i))");
+        if let Value::Number(Number::Float(f)) = v {
+            assert!((f - 5.0).abs() < 1e-10);
+        } else if let Value::Number(Number::Int(n)) = v {
+            assert_eq!(n, 5);
+        } else {
+            panic!("expected number 5, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_eval_exp_i_pi() {
+        // eval(exp(i*pi)) should be -1 (Euler's identity)
+        let v = eval("eval(exp(i*pi))");
+        match v {
+            Value::Number(Number::Int(n)) => assert_eq!(n, -1),
+            Value::Number(Number::Float(f)) => assert!((f + 1.0).abs() < 1e-10),
+            _ => panic!("expected -1, got {:?}", v),
+        }
+    }
+
+    // --- Partial evaluation tests ---
+
+    #[test]
+    fn test_eval_partial_sqrt2_times_x() {
+        // eval(sqrt(2)*x) should partially evaluate sqrt(2) but keep x
+        let v = eval("eval(sqrt(2)*x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        // Should contain a numeric approximation of sqrt(2) ≈ 1.414...
+        assert!(s.contains("1.414"), "expected sqrt(2) folded, got {}", s);
+        assert!(s.contains("x"), "expected x to remain, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_partial_pi_plus_x() {
+        // eval(pi + x) should evaluate pi to ~3.14159 but keep x
+        let v = eval("eval(pi + x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("3.14"), "expected pi folded, got {}", s);
+        assert!(s.contains("x"), "expected x to remain, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_partial_sin_pi_4_times_x() {
+        // eval(sin(pi/4)*x) should evaluate sin(pi/4) ≈ 0.707... but keep x
+        let v = eval("eval(sin(pi/4)*x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("0.707"), "expected sin(pi/4) folded, got {}", s);
+        assert!(s.contains("x"), "expected x to remain, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_partial_numeric_addition() {
+        // eval(2 + 3 + x) — the 2+3 subtree should fold to 5
+        let v = eval("eval(2 + 3 + x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        let s = format!("{}", v);
+        assert!(s.contains("5"), "expected 2+3 folded to 5, got {}", s);
+        assert!(s.contains("x"), "expected x to remain, got {}", s);
+    }
+
+    #[test]
+    fn test_eval_fully_numeric_still_works() {
+        // eval(sqrt(2) + sqrt(3)) should fully evaluate since no free vars
+        let v = eval("eval(sqrt(2) + sqrt(3))");
+        if let Value::Number(Number::Float(f)) = v {
+            let expected = 2.0_f64.sqrt() + 3.0_f64.sqrt();
+            assert!((f - expected).abs() < 1e-10);
+        } else {
+            panic!("expected float, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_eval_partial_identity() {
+        // eval on a pure free variable returns it unchanged (partial eval is identity)
+        let v = eval("eval(x)");
+        assert!(matches!(v, Value::Symbolic(_)));
+        assert_eq!(format!("{}", v), "x");
+    }
+
+    // --- Vector component tests ---
+
+    #[test]
+    fn test_component_vector_3d() {
+        let v = eval("component([3, 4, 5])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "3*e_1 + 4*e_2 + 5*e_3");
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_component_vector_2d() {
+        let v = eval("component([1, -1])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "e_1 - e_2");
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_component_vector_with_zeros() {
+        let v = eval("component([0, 3, 0])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "3*e_2");
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_component_zero_vector() {
+        let v = eval("component([0, 0, 0])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "0");
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_component_vector_4d() {
+        let v = eval("component([1, 2, 3, 4])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "e_1 + 2*e_2 + 3*e_3 + 4*e_4");
+        } else {
+            panic!("expected string, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_component_vector_floats() {
+        let v = eval("component([1.5, -2.5])");
+        if let Value::Str(s) = v {
+            assert_eq!(s, "1.5*e_1 - 2.5*e_2");
+        } else {
+            panic!("expected string, got {:?}", v);
         }
     }
 }

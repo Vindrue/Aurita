@@ -98,29 +98,3 @@ pub enum TokenKind {
     Eof,
 }
 
-impl TokenKind {
-    /// Whether this token can appear as the last token before implicit multiplication.
-    pub fn can_end_implicit_mul(&self) -> bool {
-        matches!(
-            self,
-            TokenKind::Integer(_)
-                | TokenKind::Float(_)
-                | TokenKind::Ident(_)
-                | TokenKind::RParen
-                | TokenKind::RBracket
-                | TokenKind::True
-                | TokenKind::False
-        )
-    }
-
-    /// Whether this token can appear as the first token after implicit multiplication.
-    pub fn can_start_implicit_mul(&self) -> bool {
-        matches!(
-            self,
-            TokenKind::Integer(_)
-                | TokenKind::Float(_)
-                | TokenKind::Ident(_)
-                | TokenKind::LParen
-        )
-    }
-}

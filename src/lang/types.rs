@@ -25,6 +25,18 @@ impl Quantity {
     pub fn dimensionless(value: f64, uncertainty: f64) -> Self {
         Self { value, uncertainty: uncertainty.abs(), unit: UnitExpr::dimensionless() }
     }
+
+    /// Format this quantity with derived SI unit names (e.g. Pa instead of kg/(m*s^2)).
+    pub fn display_reduced(&self) -> String {
+        let mut s = format_number(self.value);
+        if self.uncertainty > 0.0 {
+            s.push_str(&format!(" +/- {}", format_number(self.uncertainty)));
+        }
+        if !self.unit.is_dimensionless() {
+            s.push_str(&format!(" [{}]", self.unit.display_reduced()));
+        }
+        s
+    }
 }
 
 impl fmt::Display for Quantity {
@@ -191,6 +203,7 @@ impl Value {
             Value::Symbolic(s) => Some(s.clone()),
             Value::Number(Number::Int(n)) => Some(SymExpr::int(*n)),
             Value::Number(Number::Float(f)) => Some(SymExpr::float(*f)),
+            Value::Quantity(q) => Some(SymExpr::float(q.value)),
             _ => None,
         }
     }

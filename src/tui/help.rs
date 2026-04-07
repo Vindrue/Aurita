@@ -46,7 +46,7 @@ Type expressions at the prompt and press Enter to evaluate.
   x = 5           assign a variable
   f(x) = x^2      define a function
   f(3)            call a function  =>  9
-  3x + 1          implicit multiplication"),
+  |x|             absolute value"),
 
     ("Operators", "\
   +   addition           -   subtraction
@@ -65,9 +65,12 @@ Assignment:  =  +=  -=  *=  /="),
   sinh(x) cosh(x) tanh(x)    hyperbolic
   exp(x)  ln(x)   log(b,x)   exponential/log
   sqrt(x) abs(x)  sign(x)    root/absolute
+  abs2(x) conj(x)            |x|² / conjugate
   floor(x) ceil(x) round(x)  rounding
   max(a,b,...) min(a,b,...)   extrema
-  eval(expr)                  force numeric eval"),
+  eval(expr)                  force numeric eval
+  pdiff(a,b)                  percent difference
+  vec(a,b,...)                create vector"),
 
     ("CAS Operations", "\
   dif(expr, var)              differentiate
@@ -80,7 +83,12 @@ Assignment:  =  +=  -=  *=  /="),
   factor(expr)                factor
   lim(expr, var, point)       limit
   taylor(expr, var, pt, n)    Taylor series
-  tex(expr)                   LaTeX output"),
+  tex(expr)                   LaTeX output
+  grad(expr, [vars])          gradient
+  divg([field], [vars])       divergence
+  curl([field], [vars])       curl (2D or 3D)
+  component(expr)             re + im*i form
+  component([v1,v2,...])      unit vector form"),
 
     ("Plotting", "\
   plot(expr)                  plot y=expr for x
@@ -98,6 +106,7 @@ Assignment:  =  +=  -=  *=  /="),
   uncertainty(x)             get uncertainty
   nominal(x)                 get nominal value
   units(x)                   get unit string
+  reduceunits(true|false)    show derived units (Pa, N, ...)
 
   c, h, hbar, G, k_B, ...   CODATA constants"),
 
@@ -129,5 +138,6 @@ Assignment:  =  +=  -=  *=  /="),
   :clear            clear worksheet
   :help             toggle help panel
   backend(\"sympy\")  set CAS backend
-  using(\"b\", expr)  eval with backend"),
+  using(\"b\", expr)  eval with backend
+  :clearall         clear worksheet + variables/functions"),
 ];
