@@ -263,15 +263,36 @@ def maxima_to_symexpr(text):
         return {"type": "Sym", "name": text}
 
 
-def parse_solve_output(text):
+def _symexpr_contains_sym(node, name):
+    """Return True if the SymExpr JSON tree contains a Sym node with the given name."""
+    if isinstance(node, dict):
+        if node.get("type") == "Sym" and node.get("name") == name:
+            return True
+        return any(_symexpr_contains_sym(v, name) for v in node.values()
+                   if isinstance(v, (dict, list)))
+    if isinstance(node, list):
+        return any(_symexpr_contains_sym(item, name) for item in node)
+    return False
+
+
+def parse_solve_output(text, var_name=None):
     """Parse Maxima's solve output: [x = val1, x = val2, ...] → list of SymExpr JSON."""
     text = text.strip()
+
+    # Maxima may print warnings/info lines before the actual result list.
+    # Scan backwards for the last line that begins a [...] block.
+    lines = text.split('\n')
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.startswith('['):
+            text = '\n'.join(lines[i:]).strip()
+            break
 
     # Remove outer brackets
     if text.startswith("[") and text.endswith("]"):
         text = text[1:-1]
     else:
-        return [maxima_to_symexpr(text)]
+        return []
 
     if not text.strip():
         return []
@@ -300,9 +321,14 @@ def parse_solve_output(text):
         # Each part is like "x = value"
         if "=" in part:
             rhs = part.split("=", 1)[1].strip()
-            results.append(maxima_to_symexpr(rhs))
+            node = maxima_to_symexpr(rhs)
         else:
-            results.append(maxima_to_symexpr(part))
+            node = maxima_to_symexpr(part)
+        # Discard circular/implicit solutions where the solve variable appears
+        # in the RHS (e.g. Maxima returning [p = f(p)] for unsolvable equations).
+        if var_name and _symexpr_contains_sym(node, var_name):
+            continue
+        results.append(node)
 
     return results
 
@@ -368,8 +394,22 @@ def handle_request(maxima, req):
                 mvars = ", ".join(var_names)
                 cmd = f"solve([{meqs}], [{mvars}]);"
             result = maxima.execute(cmd)
-            results = parse_solve_output(result)
+            single_var = var_names[0] if len(var_names) == 1 else None
+            results = parse_solve_output(result, var_name=single_var)
             return {"id": req_id, "status": "ok", "results": results}
+
+        elif op_name == "nsolve":
+            mexpr = symexpr_to_maxima(params["expr"])
+            var = params["var"]
+            lower = params.get("lower")
+            upper = params.get("upper")
+            if lower is None or upper is None:
+                return {"id": req_id, "status": "error",
+                        "error": "maxima nsolve requires an interval [a, b]; use nsolve(expr, var, a, b)"}
+            cmd = f"find_root({mexpr}, {var}, {lower}, {upper});"
+            result = maxima.execute(cmd)
+            node = maxima_to_symexpr(result)
+            return {"id": req_id, "status": "ok", "result": node}
 
         elif op_name == "simplify":
             mexpr = symexpr_to_maxima(params["expr"])

@@ -44,6 +44,8 @@ pub struct App {
     /// Bridge script paths for CAS re-init on @clearall
     pub sympy_bridge_path: Option<String>,
     pub maxima_bridge_path: Option<String>,
+    /// Transient status bar message, cleared on next keypress
+    pub flash_message: Option<String>,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             sidebar_max_scroll: [0; 4],
             sympy_bridge_path: None,
             maxima_bridge_path: None,
+            flash_message: None,
         }
     }
 
@@ -200,6 +203,8 @@ impl App {
 
     /// Normal mode key handling.
     fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
+        // Clear transient flash message on any keypress
+        self.flash_message = None;
         match key {
             // Quit
             KeyEvent {
@@ -263,6 +268,19 @@ impl App {
                 for (i, s) in self.sidebar_scroll.iter_mut().enumerate() {
                     let max = self.sidebar_max_scroll[i];
                     *s = (*s + 1).min(max);
+                }
+                true
+            }
+
+            // Copy last output to clipboard (OSC 52)
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ..
+            } => {
+                if let Some(text) = self.last_output_text() {
+                    copy_to_clipboard(&text);
+                    self.flash_message = Some("Copied!".to_string());
                 }
                 true
             }
@@ -560,6 +578,22 @@ impl App {
             "sessions" => {
                 self.command_list_sessions();
             }
+            "copy" => {
+                if let Some(text) = self.last_output_text() {
+                    copy_to_clipboard(&text);
+                    self.worksheet.add_entry(
+                        ":copy".to_string(),
+                        OutputKind::Value("Copied to clipboard.".to_string()),
+                        vec![],
+                    );
+                } else {
+                    self.worksheet.add_entry(
+                        ":copy".to_string(),
+                        OutputKind::Error("Nothing to copy.".to_string()),
+                        vec![],
+                    );
+                }
+            }
             _ => {
                 self.worksheet.add_entry(
                     format!(":{}", cmd),
@@ -727,7 +761,7 @@ impl App {
 
         // Status bar
         let cas_status = self.evaluator.cas_status();
-        render_status_bar(frame, outer[0], &cas_status, self.session_name.as_deref());
+        render_status_bar(frame, outer[0], &cas_status, self.session_name.as_deref(), self.flash_message.as_deref());
 
         // Main area: worksheet + sidebar
         let main = Layout::horizontal([
@@ -1290,6 +1324,54 @@ impl App {
         let cursor_y = inner.y;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+
+    /// Return the last worksheet output as a plain string, if any.
+    fn last_output_text(&self) -> Option<String> {
+        for entry in self.worksheet.entries.iter().rev() {
+            match &entry.output {
+                OutputKind::Value(v) if v != "()" => return Some(v.clone()),
+                OutputKind::Error(e) => return Some(e.clone()),
+                OutputKind::PrintOutput(lines) => return Some(lines.join("\n")),
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
+/// Write `text` to the system clipboard, trying multiple strategies in order.
+fn copy_to_clipboard(text: &str) {
+    // Wayland
+    if clipboard_via_cmd(&["wl-copy", "--"], text) { return; }
+    // X11
+    if clipboard_via_cmd(&["xclip", "-selection", "clipboard"], text) { return; }
+    if clipboard_via_cmd(&["xsel", "--clipboard", "--input"], text) { return; }
+    // Terminal OSC 52 fallback (may need clipboard_control=write-clipboard in kitty.conf)
+    clipboard_via_osc52(text);
+}
+
+fn clipboard_via_cmd(argv: &[&str], text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else { return false; };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    matches!(child.wait(), Ok(s) if s.success())
+}
+
+fn clipboard_via_osc52(text: &str) {
+    use base64::Engine as _;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stdout().flush();
 }
 
 /// Check if a function name is known (builtin math, CAS op, or utility).
@@ -1303,8 +1385,8 @@ fn is_known_function(name: &str) -> bool {
         | "abs" | "abs2" | "conj"
         | "sign" | "floor" | "ceil" | "round"
         // CAS operations
-        | "dif" | "int" | "solve" | "simplify" | "expand" | "factor"
-        | "lim" | "taylor" | "tex"
+        | "dif" | "int" | "solve" | "nsolve" | "simplify" | "expand" | "factor"
+        | "lim" | "taylor" | "tex" | "latex"
         // Vector calculus
         | "grad" | "divg" | "curl"
         // Utility

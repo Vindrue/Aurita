@@ -306,7 +306,8 @@ fn fmt_mul_analysis(analysis: &MulAnalysis<'_>, show_sign: bool, f: &mut fmt::Fo
                     write!(f, "*")?;
                 }
                 // If analyze_mul extracted sign from a negative int, display its absolute value
-                if analysis.negative && i == 0 {
+                // (the negative int may appear at any position in the factor chain)
+                if analysis.negative {
                     if let SymExpr::Int { value } = factor {
                         if *value < 0 {
                             write!(f, "{}", -value)?;
@@ -342,7 +343,7 @@ fn fmt_mul_analysis(analysis: &MulAnalysis<'_>, show_sign: bool, f: &mut fmt::Fo
                 if i > 0 {
                     write!(f, "*")?;
                 }
-                if analysis.negative && i == 0 {
+                if analysis.negative {
                     if let SymExpr::Int { value } = factor {
                         if *value < 0 {
                             write!(f, "{}", -value)?;
@@ -689,8 +690,8 @@ impl SymExpr {
             "1".to_string()
         } else {
             let mut parts = Vec::new();
-            for (i, factor) in analysis.numer.iter().enumerate() {
-                let s = if analysis.negative && i == 0 {
+            for factor in analysis.numer.iter() {
+                let s = if analysis.negative {
                     if let SymExpr::Int { value } = factor {
                         if *value < 0 { format!("{}", -value) } else { factor.format_pretty() }
                     } else { factor.format_pretty() }
@@ -768,8 +769,8 @@ impl SymExpr {
                     "1".to_string()
                 } else {
                     let mut parts = Vec::new();
-                    for (i, factor) in analysis.numer.iter().enumerate() {
-                        let fs = if analysis.negative && i == 0 {
+                    for factor in analysis.numer.iter() {
+                        let fs = if analysis.negative {
                             if let SymExpr::Int { value } = factor {
                                 if *value < 0 { format!("{}", -value) } else { factor.format_pretty() }
                             } else { factor.format_pretty() }
@@ -971,6 +972,16 @@ mod tests {
             ),
         );
         assert_eq!(format!("{}", expr), "a - 2*f*i*m");
+    }
+
+    #[test]
+    fn test_neg_coeff_trailing() {
+        // m * B * Int(-3) → "-m*B*3" (negative int is last in chain)
+        let expr = SymExpr::mul(
+            SymExpr::sym("m"),
+            SymExpr::mul(SymExpr::sym("B"), SymExpr::int(-3)),
+        );
+        assert_eq!(format!("{}", expr), "-m*B*3");
     }
 
     #[test]

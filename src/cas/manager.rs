@@ -192,6 +192,24 @@ impl CasManager {
         self.execute_op(op, ResponseKind::Single)
     }
 
+    pub fn nsolve(
+        &mut self,
+        expr: &SymExpr,
+        var: &str,
+        x0: f64,
+        lower: Option<f64>,
+        upper: Option<f64>,
+    ) -> Result<CasResult, String> {
+        let op = CasOp::Nsolve {
+            expr: expr.clone(),
+            var: var.to_string(),
+            x0,
+            lower,
+            upper,
+        };
+        self.execute_op(op, ResponseKind::Single)
+    }
+
     pub fn component(&mut self, expr: &SymExpr) -> Result<CasResult, String> {
         let op = CasOp::Component { expr: expr.clone() };
         self.execute_op(op, ResponseKind::Multiple)

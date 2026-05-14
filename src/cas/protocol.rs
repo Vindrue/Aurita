@@ -60,6 +60,16 @@ pub enum CasOp {
         var: String,
         x_values: Vec<f64>,
     },
+    #[serde(rename = "nsolve")]
+    Nsolve {
+        expr: SymExpr,
+        var: String,
+        /// Initial guess (midpoint of interval when bounds are given).
+        x0: f64,
+        /// Optional bracketing interval for guaranteed-convergence methods.
+        lower: Option<f64>,
+        upper: Option<f64>,
+    },
     #[serde(rename = "render_plot")]
     RenderPlot {
         series: Vec<PlotSeriesData>,

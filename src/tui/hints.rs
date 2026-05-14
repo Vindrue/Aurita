@@ -15,12 +15,14 @@ pub static FUNCTION_HINTS: &[FuncHint] = &[
     FuncHint { name: "dif",      signature: "dif(expr, var?, order?)",         description: "Differentiate expression" },
     FuncHint { name: "int",      signature: "int(expr, var?, lo..hi or lo, hi)", description: "Integrate expression" },
     FuncHint { name: "solve",    signature: "solve(expr, var?)",               description: "Solve equation for variable" },
+    FuncHint { name: "nsolve",   signature: "nsolve(expr, x0) or nsolve(expr, var, x0) or nsolve(expr, var, a, b)", description: "Numerically solve equation (Newton/bisect)" },
     FuncHint { name: "simplify", signature: "simplify(expr) or simplify(true|false)", description: "Simplify expression or toggle auto-simplify" },
     FuncHint { name: "expand",   signature: "expand(expr)",                    description: "Expand expression" },
     FuncHint { name: "factor",   signature: "factor(expr)",                    description: "Factor expression" },
     FuncHint { name: "lim",      signature: "lim(expr, var, point, dir?)",     description: "Compute limit" },
     FuncHint { name: "taylor",   signature: "taylor(expr, var, point, order?)", description: "Taylor series expansion" },
     FuncHint { name: "tex",      signature: "tex(expr)",                       description: "Convert to LaTeX string" },
+    FuncHint { name: "latex",    signature: "latex(expr)",                     description: "Convert to LaTeX string (alias for tex)" },
     // Plot
     FuncHint { name: "plot",     signature: "plot(expr, range?) or plot([e1, e2, ...], range?)", description: "Plot expression(s)" },
     // Numeric eval

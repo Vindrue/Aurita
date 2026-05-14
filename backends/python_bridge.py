@@ -17,7 +17,7 @@ from sympy import (
     Symbol, symbols, Integer, Rational, Float, pi, E, I, oo,
     sin, cos, tan, asin, acos, atan, sinh, cosh, tanh,
     exp, log, sqrt, Abs, sign, floor, ceiling,
-    diff, integrate, limit, series, solve, simplify, expand, factor,
+    diff, integrate, limit, series, solve, nsolve, simplify, expand, factor,
     latex, refine, Piecewise, lambdify,
 )
 from sympy.assumptions.ask import Q
@@ -395,10 +395,20 @@ def handle_request(req):
             equations = [expr_from_json(eq) for eq in params["equations"]]
             var_names = params["vars"]
             var_syms = [get_symbol(v, real=True) for v in var_names]
-            if len(var_syms) == 1:
-                result = solve(equations[0] if len(equations) == 1 else equations, var_syms[0])
-            else:
-                result = solve(equations, var_syms)
+            try:
+                if len(var_syms) == 1:
+                    result = solve(equations[0] if len(equations) == 1 else equations, var_syms[0])
+                else:
+                    result = solve(equations, var_syms)
+            except TypeError as e:
+                if "cannot determine truth value" in str(e):
+                    # The solve algorithm hit an undecidable relational comparison
+                    # (e.g. "5 < 60*p**8") during domain reasoning — this happens for
+                    # transcendental equations with no closed-form solution.
+                    # Return empty rather than propagating a confusing TypeError.
+                    result = []
+                else:
+                    raise
 
             # Convert results
             if isinstance(result, dict):
@@ -419,6 +429,21 @@ def handle_request(req):
                 results = [expr_to_json(result)]
 
             return {"id": req_id, "status": "ok", "results": results}
+
+        elif op_name == "nsolve":
+            expr = expr_from_json(params["expr"])
+            var = get_symbol(params["var"], real=True)
+            x0 = params["x0"]
+            lower = params.get("lower")
+            upper = params.get("upper")
+            if lower is not None and upper is not None:
+                # Bracketed Brent's method — more robust than Newton for stiff functions.
+                from sympy.calculus.util import continuous_domain
+                result = nsolve(expr, var, x0, solver="bisect",
+                                bounds=[lower, upper])
+            else:
+                result = nsolve(expr, var, x0)
+            return {"id": req_id, "status": "ok", "result": expr_to_json(result)}
 
         elif op_name == "simplify":
             expr = expr_from_json(params["expr"])

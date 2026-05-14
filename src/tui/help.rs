@@ -78,6 +78,8 @@ Assignment:  =  +=  -=  *=  /="),
   int(expr, var)              indefinite integral
   int(expr, var, a..b)        definite integral
   solve(expr, var)            solve equation
+  nsolve(expr, var, x0)      numerical solve (Newton)
+  nsolve(expr, var, a, b)    numerical solve (bisection)
   simplify(expr)              simplify
   expand(expr)                expand
   factor(expr)                factor

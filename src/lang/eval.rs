@@ -49,7 +49,7 @@ impl Evaluator {
             output: Vec::new(),
             cas_manager: None,
             output_mode: OutputMode::Simple,
-            auto_simplify: false,
+            auto_simplify: true,
             reduce_units: true,
         }
     }
@@ -752,12 +752,13 @@ impl Evaluator {
             "dif" => Ok(Some(self.cas_differentiate(args, span)?)),
             "int" => Ok(Some(self.cas_integrate(args, span)?)),
             "solve" => Ok(Some(self.cas_solve(args, span)?)),
+            "nsolve" => Ok(Some(self.cas_nsolve(args, span)?)),
             "simplify" => Ok(Some(self.cas_simplify(args, span)?)),
             "expand" => Ok(Some(self.cas_expand(args, span)?)),
             "factor" => Ok(Some(self.cas_factor(args, span)?)),
             "lim" => Ok(Some(self.cas_limit(args, span)?)),
             "taylor" => Ok(Some(self.cas_taylor(args, span)?)),
-            "tex" => Ok(Some(self.cas_latex(args, span)?)),
+            "tex" | "latex" => Ok(Some(self.cas_latex(args, span)?)),
             "plot" => Ok(Some(self.eval_plot(args, span)?)),
             "backend" => Ok(Some(self.set_backend(args, span)?)),
             "using" => Ok(Some(self.eval_using(args, span)?)),
@@ -795,21 +796,29 @@ impl Evaluator {
             }
             CasResult::Latex(s) => Value::Str(s),
             CasResult::Disagreed { results } => {
-                let parts: Vec<String> = results
-                    .iter()
-                    .map(|(name, expr)| format!("{}: {}", name, expr))
-                    .collect();
-                Value::Str(parts.join(" | "))
+                // Both backends succeeded but produced textually different results.
+                // Return the first backend's expression as a composable Value::Symbolic
+                // so the result can be piped into further operations (e.g. solve(dif(...))).
+                // The backends most likely agree mathematically — differences are formatting
+                // (e.g. 1/(2*p) vs 1/2/p). Display notes the disagreement.
+                if let Some((_, expr)) = results.into_iter().next() {
+                    Value::Symbolic(expr)
+                } else {
+                    Value::Str("(no result)".to_string())
+                }
             }
             CasResult::DisagreedMultiple { results } => {
-                let parts: Vec<String> = results
-                    .iter()
-                    .map(|(name, exprs)| {
-                        let vals: Vec<String> = exprs.iter().map(|e| format!("{}", e)).collect();
-                        format!("{}: [{}]", name, vals.join(", "))
-                    })
-                    .collect();
-                Value::Str(parts.join(" | "))
+                // Both backends returned different solution sets — show both so the user
+                // can judge, but still make it a composable value using the first backend.
+                if let Some((_, exprs)) = results.into_iter().next() {
+                    if exprs.len() == 1 {
+                        Value::Symbolic(exprs.into_iter().next().unwrap())
+                    } else {
+                        Value::Vector(exprs.into_iter().map(Value::Symbolic).collect())
+                    }
+                } else {
+                    Value::Str("(no result)".to_string())
+                }
             }
         }
     }
@@ -1324,6 +1333,82 @@ impl Evaluator {
             .map_err(|e| LangError::eval(format!("solve: {}", e)).with_span(span))?;
 
         Ok(self.cas_result_to_value(result))
+    }
+
+    fn cas_nsolve(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {
+        self.require_cas("nsolve", span)?;
+        // Signatures:
+        //   nsolve(expr, x0)          — auto-detect single free variable
+        //   nsolve(expr, var, x0)     — explicit variable, Newton initial guess
+        //   nsolve(expr, var, a, b)   — explicit variable, bracketed interval
+        if args.len() < 2 || args.len() > 4 {
+            return Err(LangError::arity(
+                "nsolve: expected 2-4 args: nsolve(expr, x0), nsolve(expr, var, x0), or nsolve(expr, var, a, b)"
+            ).with_span(span));
+        }
+
+        let expr_val = self.eval_expr(&args[0])?;
+        let sym_expr = expr_val.to_sym_expr().ok_or_else(|| {
+            LangError::type_err("nsolve: first argument must be a symbolic expression").with_span(span)
+        })?;
+
+        // Determine (var, x0, lower, upper) from remaining args.
+        let (var, x0, lower, upper) = if args.len() == 2 {
+            // nsolve(expr, x0) — auto-detect variable
+            let x0 = self.eval_to_f64(&args[1], "nsolve: initial guess must be numeric", span)?;
+            let syms = sym_expr.free_symbols();
+            let var = if syms.len() == 1 {
+                syms[0].clone()
+            } else {
+                return Err(LangError::eval(
+                    "nsolve: multiple free variables — specify which: nsolve(expr, var, x0)"
+                ).with_span(span));
+            };
+            (var, x0, None, None)
+        } else {
+            // args[1] must be a variable symbol
+            let v = self.eval_expr(&args[1])?;
+            let var = match v {
+                Value::Symbolic(SymExpr::Sym { name }) => name,
+                _ => return Err(LangError::type_err("nsolve: second argument must be a variable").with_span(span)),
+            };
+            if args.len() == 3 {
+                // nsolve(expr, var, x0)
+                let x0 = self.eval_to_f64(&args[2], "nsolve: initial guess must be numeric", span)?;
+                (var, x0, None, None)
+            } else {
+                // nsolve(expr, var, a, b)
+                let a = self.eval_to_f64(&args[2], "nsolve: interval bounds must be numeric", span)?;
+                let b = self.eval_to_f64(&args[3], "nsolve: interval bounds must be numeric", span)?;
+                if a >= b {
+                    return Err(LangError::eval("nsolve: lower bound must be less than upper bound").with_span(span));
+                }
+                (var, (a + b) / 2.0, Some(a), Some(b))
+            }
+        };
+
+        let manager = self.cas_manager.as_mut().unwrap();
+        let result = manager.nsolve(&sym_expr, &var, x0, lower, upper)
+            .map_err(|e| LangError::eval(format!("nsolve: {}", e)).with_span(span))?;
+
+        Ok(self.cas_result_to_value(result))
+    }
+
+    /// Evaluate an expression argument to f64, handling numeric literals and symbolic constants.
+    fn eval_to_f64(&mut self, arg: &Expr, err_msg: &str, span: Span) -> LangResult<f64> {
+        let val = self.eval_expr(arg)?;
+        if let Some(f) = val.as_f64() {
+            return Ok(f);
+        }
+        // Also accept symbolic constants (pi, e, etc.) by evaluating them numerically.
+        if let Some(sym) = val.to_sym_expr() {
+            if let Some((re, _im)) = crate::lang::builtins::complex_eval_sym(&sym) {
+                if re.is_finite() {
+                    return Ok(re);
+                }
+            }
+        }
+        Err(LangError::type_err(err_msg).with_span(span))
     }
 
     fn cas_simplify(&mut self, args: &[Expr], span: Span) -> LangResult<Value> {

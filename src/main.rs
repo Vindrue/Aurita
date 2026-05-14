@@ -2,7 +2,10 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::{
-    event::{EnableMouseCapture, DisableMouseCapture},
+    event::{
+        EnableMouseCapture, DisableMouseCapture,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,6 +25,9 @@ fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Enable kitty keyboard protocol so modifier combos (Ctrl+Alt+…) are reported unambiguously.
+    // Gracefully ignored by terminals that don't support it.
+    let _ = execute!(stdout, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -30,6 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
